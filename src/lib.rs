@@ -287,8 +287,12 @@ fn bfd(lengths: &[f64], demand: &[u32], stock_length: f64, kerf: f64) -> Vec<Pat
     bars.into_iter().map(|b| b.counts).collect()
 }
 
-/// Branch-and-bound solver. Returns the list of patterns (one per bar) that
-/// minimizes the number of bars while meeting all demand.
+/// Branch-and-bound solver that decides *how many times* to use each pattern.
+///
+/// Instead of choosing a pattern for each bar (which has permutation symmetry and
+/// explodes combinatorially), we iterate over patterns and decide how many copies
+/// of each to use. This eliminates symmetry and makes the search tractable.
+///
 /// Returns (assignment, exact) where exact=true if the search completed fully.
 fn bnb_solve(
     patterns: &[Pattern],
@@ -303,49 +307,106 @@ fn bnb_solve(
     // Start with BFD as upper bound
     let bfd_result = bfd(lengths, demand, stock_length, kerf);
     let mut best_count = bfd_result.len();
-    let mut best_assignment: Vec<Pattern> = bfd_result;
+    let mut best_multiplicities: Vec<u32> = Vec::new(); // empty = use bfd_result directly
+    let mut used_bfd = true;
 
-    // Sort patterns by material used (descending) — try dense patterns first
-    let mut sorted_patterns: Vec<&Pattern> = patterns.iter().collect();
-    sorted_patterns.sort_by(|a, b| {
-        let ua = pattern_material(a, lengths, kerf);
-        let ub = pattern_material(b, lengths, kerf);
-        ub.partial_cmp(&ua).unwrap()
-    });
+    // Sort patterns by material used (descending) — try dense patterns first.
+    // Also filter out dominated patterns (where another pattern is >= in every dimension).
+    let mut scored: Vec<(usize, f64)> = patterns
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, pattern_material(p, lengths, kerf)))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let sorted_indices: Vec<usize> = scored.iter().map(|&(i, _)| i).collect();
 
-    // Precompute max of each part type across all patterns (for lower bound)
-    let max_per_bar: Vec<u32> = (0..n)
-        .map(|i| patterns.iter().map(|p| p[i]).max().unwrap_or(0))
+    // Filter dominated patterns: pattern A dominates B if A[i] >= B[i] for all i
+    // and A != B. Keep only non-dominated patterns.
+    let mut keep = vec![true; sorted_indices.len()];
+    for (si, &ai) in sorted_indices.iter().enumerate() {
+        if !keep[si] {
+            continue;
+        }
+        for (sj, &bj) in sorted_indices.iter().enumerate() {
+            if si == sj || !keep[sj] {
+                continue;
+            }
+            // Does pattern ai dominate pattern bj?
+            if patterns[ai]
+                .iter()
+                .zip(patterns[bj].iter())
+                .all(|(&a, &b)| a >= b)
+                && patterns[ai] != patterns[bj]
+            {
+                keep[sj] = false;
+            }
+        }
+    }
+    let filtered: Vec<usize> = sorted_indices
+        .iter()
+        .enumerate()
+        .filter(|&(si, _)| keep[si])
+        .map(|(_, &i)| i)
         .collect();
 
-    let mut chosen: Vec<Pattern> = Vec::new();
-    let mut filled: Vec<i32> = vec![0; n];
+    // Precompute: for each part type, the max count achievable by any remaining
+    // pattern from index pi onward (used for the lower bound).
+    // max_from[pi][j] = max of patterns[filtered[pi..]][j]
+    let np = filtered.len();
+    let mut max_from: Vec<Vec<u32>> = vec![vec![0; n]; np + 1];
+    for pi in (0..np).rev() {
+        let pat = &patterns[filtered[pi]];
+        for j in 0..n {
+            max_from[pi][j] = max_from[pi + 1][j].max(pat[j]);
+        }
+    }
+
+    let mut multiplicities: Vec<u32> = vec![0; np];
+    let mut remaining: Vec<i32> = demand.iter().map(|&d| d as i32).collect();
+    let mut total_bars: usize = 0;
     let mut timed_out = false;
     let mut nodes: u64 = 0;
 
-    search(
-        &mut filled,
-        demand,
-        &mut chosen,
-        &sorted_patterns,
-        &max_per_bar,
+    bnb_search(
+        0,
+        &filtered,
+        patterns,
+        &mut remaining,
+        &mut total_bars,
+        &mut multiplicities,
         &mut best_count,
-        &mut best_assignment,
+        &mut best_multiplicities,
+        &mut used_bfd,
+        &max_from,
         deadline,
         &mut timed_out,
         &mut nodes,
     );
 
-    (best_assignment, !timed_out)
+    // Expand the best result into a flat list of patterns
+    if used_bfd {
+        return (bfd_result, !timed_out);
+    }
+
+    let mut assignment: Vec<Pattern> = Vec::new();
+    for (si, &count) in best_multiplicities.iter().enumerate() {
+        for _ in 0..count {
+            assignment.push(patterns[filtered[si]].clone());
+        }
+    }
+    (assignment, !timed_out)
 }
 
-fn lower_bound(remaining: &[i32], max_per_bar: &[u32]) -> usize {
+/// Lower bound: for each part type with remaining demand, compute
+/// ceil(remaining / max_achievable_per_bar) using only patterns from
+/// index `from_pat` onward. Take the max across all part types.
+fn lower_bound_from(remaining: &[i32], max_from: &[u32]) -> usize {
     let mut lb: usize = 0;
     for (i, &r) in remaining.iter().enumerate() {
         if r <= 0 {
             continue;
         }
-        let m = max_per_bar[i];
+        let m = max_from[i];
         if m == 0 {
             return usize::MAX;
         }
@@ -355,14 +416,17 @@ fn lower_bound(remaining: &[i32], max_per_bar: &[u32]) -> usize {
     lb
 }
 
-fn search(
-    filled: &mut Vec<i32>,
-    demand: &[u32],
-    chosen: &mut Vec<Pattern>,
-    sorted_patterns: &[&Pattern],
-    max_per_bar: &[u32],
+fn bnb_search(
+    pat_idx: usize,
+    filtered: &[usize],
+    patterns: &[Pattern],
+    remaining: &mut Vec<i32>,
+    total_bars: &mut usize,
+    multiplicities: &mut Vec<u32>,
     best_count: &mut usize,
-    best_assignment: &mut Vec<Pattern>,
+    best_multiplicities: &mut Vec<u32>,
+    used_bfd: &mut bool,
+    max_from: &[Vec<u32>],
     deadline: Instant,
     timed_out: &mut bool,
     nodes: &mut u64,
@@ -371,68 +435,78 @@ fn search(
         return;
     }
 
-    // Check deadline every 10k nodes
     *nodes += 1;
     if *nodes % 10_000 == 0 && Instant::now() >= deadline {
         *timed_out = true;
         return;
     }
 
-    let remaining: Vec<i32> = demand
-        .iter()
-        .zip(filled.iter())
-        .map(|(&d, &f)| d as i32 - f)
-        .collect();
-
+    // All demand satisfied?
     if remaining.iter().all(|&r| r <= 0) {
-        if chosen.len() < *best_count {
-            *best_count = chosen.len();
-            *best_assignment = chosen.clone();
+        if *total_bars < *best_count {
+            *best_count = *total_bars;
+            *best_multiplicities = multiplicities.clone();
+            *used_bfd = false;
         }
         return;
     }
 
-    if chosen.len() + lower_bound(&remaining, max_per_bar) >= *best_count {
+    // No more patterns to try?
+    if pat_idx >= filtered.len() {
         return;
     }
 
-    // Branch on the part type with highest remaining demand
-    let pivot = remaining
-        .iter()
-        .enumerate()
-        .filter(|&(_, r)| *r > 0)
-        .max_by_key(|&(_, r)| *r)
-        .map(|(i, _)| i)
-        .unwrap();
+    // Prune: even with the best remaining patterns, can we beat best_count?
+    if *total_bars + lower_bound_from(remaining, &max_from[pat_idx]) >= *best_count {
+        return;
+    }
 
-    for pattern in sorted_patterns {
-        if pattern[pivot] == 0 {
-            continue;
+    let pat = &patterns[filtered[pat_idx]];
+
+    // Upper bound on how many times we could use this pattern:
+    // limited by demand (don't overshoot by more than necessary) and bar budget.
+    let max_uses = {
+        let mut max_by_demand = *best_count - *total_bars - 1; // must leave room to improve
+        for (j, &r) in remaining.iter().enumerate() {
+            if pat[j] > 0 && r > 0 {
+                // At most ceil(r / pat[j]) copies needed for this part type
+                let needed = (r as u32 + pat[j] - 1) / pat[j];
+                max_by_demand = max_by_demand.min(needed as usize);
+            }
+        }
+        max_by_demand
+    };
+
+    // Try using this pattern k times (from max down to 0 — try high usage first)
+    for k in (0..=max_uses).rev() {
+        multiplicities[pat_idx] = k as u32;
+        *total_bars += k;
+        for (j, &c) in pat.iter().enumerate() {
+            remaining[j] -= (k as u32 * c) as i32;
         }
 
-        chosen.push((*pattern).clone());
-        for (i, &c) in pattern.iter().enumerate() {
-            filled[i] += c as i32;
-        }
-
-        search(
-            filled,
-            demand,
-            chosen,
-            sorted_patterns,
-            max_per_bar,
+        bnb_search(
+            pat_idx + 1,
+            filtered,
+            patterns,
+            remaining,
+            total_bars,
+            multiplicities,
             best_count,
-            best_assignment,
+            best_multiplicities,
+            used_bfd,
+            max_from,
             deadline,
             timed_out,
             nodes,
         );
 
-        for (i, &c) in pattern.iter().enumerate() {
-            filled[i] -= c as i32;
+        for (j, &c) in pat.iter().enumerate() {
+            remaining[j] += (k as u32 * c) as i32;
         }
-        chosen.pop();
+        *total_bars -= k;
     }
+    multiplicities[pat_idx] = 0;
 }
 
 fn build_bar(pattern: &Pattern, lengths: &[f64], stock_length: f64, kerf: f64) -> Bar {
