@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bar Stock Cut Optimizer</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f5f5f2;color:#1a1a18;min-height:100vh;padding:1.5rem}
+h1{font-size:1.3rem;font-weight:600;margin-bottom:1.5rem}
+.card{background:#fff;border:0.5px solid #ddd;border-radius:10px;padding:1.25rem;margin-bottom:1rem}
+.row{display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:1rem}
+.field{display:flex;flex-direction:column;gap:4px;min-width:120px;flex:1}
+label{font-size:12px;color:#666;font-weight:500}
+input[type=number]{border:0.5px solid #ccc;border-radius:6px;padding:6px 10px;font-size:14px;width:100%;outline:none;background:#fff;color:#1a1a18}
+input:focus{border-color:#5a7fc9;box-shadow:0 0 0 2px rgba(90,127,201,0.15)}
+.parts-row{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+.parts-row input{flex:1}
+.btn-sm{background:transparent;border:0.5px solid #ccc;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:13px;color:#555}
+.btn-sm:hover{background:#f0f0ec;border-color:#aaa}
+.btn-primary{background:#3a6bc9;color:#fff;border:none;border-radius:8px;padding:10px 24px;cursor:pointer;font-size:14px;font-weight:500}
+.btn-primary:hover{background:#2d5ab5}
+.btn-primary:disabled{background:#aaa;cursor:not-allowed}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:1rem}
+.stat{background:#f5f5f2;border-radius:8px;padding:12px 14px}
+.stat-label{font-size:11px;color:#888;margin-bottom:4px}
+.stat-val{font-size:20px;font-weight:600;color:#1a1a18}
+.stat-val.good{color:#2d7a45}
+.stat-val.warn{color:#b06020}
+.bar-group{margin-bottom:18px}
+.bar-group-label{font-size:12px;color:#666;margin-bottom:4px;font-weight:500}
+.bar-group-count{font-weight:600;color:#1a1a18}
+svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
+.legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:11px;color:#555}
+.legend-item{display:flex;align-items:center;gap:4px}
+.legend-dot{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+#status{font-size:13px;color:#888;margin-top:8px;min-height:18px}
+.section-title{font-size:13px;font-weight:600;color:#555;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em}
+.add-part-row{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+.suggestion{background:#f0f5ff;border:0.5px solid #c0d0e8;border-radius:8px;padding:12px 14px;margin-bottom:8px;cursor:pointer;transition:background 0.15s}
+.suggestion:hover{background:#e4ecfa}
+.suggestion-header{display:flex;justify-content:space-between;align-items:center}
+.suggestion-title{font-size:13px;font-weight:600;color:#3a6bc9}
+.suggestion-toggle{font-size:11px;color:#888}
+.suggestion-detail{font-size:12px;color:#555;margin-top:4px}
+.suggestion-breakdown{margin-top:10px;padding-top:10px;border-top:0.5px solid #c0d0e8;display:none}
+.suggestion-breakdown.open{display:block}
+.compare-table{width:100%;border-collapse:collapse;font-size:13px}
+.compare-table th{text-align:left;font-size:11px;color:#888;font-weight:500;padding:6px 10px;border-bottom:0.5px solid #ddd}
+.compare-table td{padding:6px 10px;border-bottom:0.5px solid #eee}
+.compare-table .val{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+.compare-table .good{color:#2d7a45}
+.compare-table .dim{color:#aaa}
+.compare-savings{margin-top:10px;font-size:13px;color:#2d7a45;font-weight:500}
+.naive-breakdown{margin-top:10px;font-size:12px;color:#666}
+.naive-breakdown span{display:inline-block;margin-right:14px}
+</style>
+</head>
+<body>
+<h1>Bar Stock Cut Optimizer</h1>
+
+<div class="card">
+  <div class="row">
+    <div class="field">
+      <label>Stock length (in)</label>
+      <input type="number" id="stockLen" value="72" min="1" step="0.125">
+    </div>
+    <div class="field">
+      <label>Kerf (in)</label>
+      <input type="number" id="kerf" value="0.125" min="0" step="0.0625">
+    </div>
+    <div class="field">
+      <label>Solve budget (s)</label>
+      <input type="number" id="solveSec" value="5" min="0.1" step="0.5">
+    </div>
+    <div class="field">
+      <label>Extra bars to try</label>
+      <input type="number" id="maxExtraBars" value="3" min="0" step="1">
+    </div>
+    <div class="field">
+      <label>Suggestion budget (s)</label>
+      <input type="number" id="suggestSec" value="5" min="0" step="0.5">
+    </div>
+  </div>
+  <div class="section-title">Parts needed</div>
+  <div id="partsList"></div>
+  <div class="add-part-row" style="margin-top:8px">
+    <div class="field" style="min-width:100px;max-width:140px">
+      <label>Length (in)</label>
+      <input type="number" id="newLen" value="12" min="0.1" step="0.125">
+    </div>
+    <div class="field" style="min-width:80px;max-width:120px">
+      <label>Qty</label>
+      <input type="number" id="newQty" value="4" min="1" step="1">
+    </div>
+    <button class="btn-sm" id="addBtn">+ Add</button>
+  </div>
+  <div style="margin-top:1.25rem;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <button class="btn-primary" id="solveBtn" disabled>Loading WASM...</button>
+    <div id="status"></div>
+  </div>
+</div>
+
+<div class="card" id="comparisonCard" style="display:none">
+  <div class="section-title">Naive vs. Optimized</div>
+  <div id="comparisonBody"></div>
+</div>
+
+<div class="card" id="resultsCard" style="display:none">
+  <div class="section-title">Optimized cut plan</div>
+  <div class="stat-grid" id="statsGrid"></div>
+  <div id="visualization"></div>
+  <div class="legend" id="legend"></div>
+</div>
+
+<div class="card" id="suggestionsCard" style="display:none">
+  <div class="section-title">Overproduction suggestions</div>
+  <div id="suggestionsBody"></div>
+</div>
+
+<script type="module">
+import init, { optimize_json } from './pkg/stock_optimizer.js';
+
+const COLORS = ['#4a7fd4','#5ba85c','#d47a4a','#a855a0','#d4b94a','#4ab8d4','#d44a6a','#7a9e4a','#d4664a','#4a9ed4'];
+
+let parts = [];
+let nextId = 0;
+let wasmReady = false;
+
+async function loadWasm() {
+  await init();
+  wasmReady = true;
+  const btn = document.getElementById('solveBtn');
+  btn.disabled = false;
+  btn.textContent = 'Optimize cuts';
+}
+loadWasm();
+
+function addPart(len, qty) {
+  len = len || parseFloat(document.getElementById('newLen').value);
+  qty = qty || parseInt(document.getElementById('newQty').value);
+  if (isNaN(len) || len <= 0 || isNaN(qty) || qty < 1) return;
+  parts.push({id: nextId++, len, qty});
+  renderParts();
+  syncURL();
+}
+
+function removePart(id) {
+  parts = parts.filter(p => p.id !== id);
+  renderParts();
+  syncURL();
+}
+
+function renderParts() {
+  const el = document.getElementById('partsList');
+  el.innerHTML = '';
+  parts.forEach((p, i) => {
+    const row = document.createElement('div');
+    row.className = 'parts-row';
+    row.innerHTML = `<span style="min-width:20px;color:#888;font-size:12px">${i+1}.</span>
+      <input type="number" value="${p.len}" min="0.1" step="0.125" style="max-width:110px" data-idx="${i}" data-field="len">
+      <span style="font-size:12px;color:#888">in &times;</span>
+      <input type="number" value="${p.qty}" min="1" step="1" style="max-width:70px" data-idx="${i}" data-field="qty">
+      <button class="btn-sm" data-remove="${p.id}" style="color:#c04040;border-color:#e8c0c0">&times;</button>`;
+    el.appendChild(row);
+  });
+}
+
+function syncURL() {
+  const stockLen = document.getElementById('stockLen').value;
+  const kerf = document.getElementById('kerf').value;
+  const ps = parts.map(p => `${p.len}x${p.qty}`).join(',');
+  const params = new URLSearchParams({stockLen, kerf, parts: ps});
+  history.replaceState(null, '', '?' + params.toString());
+}
+
+function loadFromURL() {
+  const p = new URLSearchParams(location.search);
+  if (p.has('stockLen')) document.getElementById('stockLen').value = p.get('stockLen');
+  if (p.has('kerf')) document.getElementById('kerf').value = p.get('kerf');
+  if (p.has('parts') && p.get('parts')) {
+    p.get('parts').split(',').forEach(s => {
+      const m = s.match(/^([\d.]+)x(\d+)$/);
+      if (m) addPart(parseFloat(m[1]), parseInt(m[2]));
+    });
+  }
+  if (!parts.length) {
+    addPart(12, 4); addPart(16, 3); addPart(20, 2); addPart(24, 2);
+  }
+}
+
+['stockLen','kerf'].forEach(id => document.getElementById(id).addEventListener('change', syncURL));
+document.getElementById('addBtn').addEventListener('click', () => addPart());
+document.getElementById('solveBtn').addEventListener('click', solve);
+document.getElementById('partsList').addEventListener('change', e => {
+  const idx = e.target.dataset.idx, field = e.target.dataset.field;
+  if (idx === undefined) return;
+  if (field === 'len') parts[idx].len = parseFloat(e.target.value) || parts[idx].len;
+  if (field === 'qty') parts[idx].qty = parseInt(e.target.value) || parts[idx].qty;
+  syncURL();
+});
+document.getElementById('partsList').addEventListener('click', e => {
+  const id = e.target.dataset.remove;
+  if (id !== undefined) removePart(+id);
+});
+
+// --- Bar pattern grouping ---
+
+function barKey(bar) {
+  return bar.cuts.map(c => `${c.part_index}:${c.length}`).join(',');
+}
+
+function groupBars(bars) {
+  const groups = [];
+  const seen = new Map();
+  for (const bar of bars) {
+    const key = barKey(bar);
+    if (seen.has(key)) {
+      seen.get(key).count++;
+    } else {
+      const group = { bar, count: 1 };
+      seen.set(key, group);
+      groups.push(group);
+    }
+  }
+  return groups;
+}
+
+// --- SVG rendering ---
+
+function renderBarSvg(bar, stockLen, kerf) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'bar-vis');
+  svg.setAttribute('viewBox', '0 0 1000 36');
+  svg.setAttribute('preserveAspectRatio', 'none');
+
+  let x = 0;
+  const scale = 1000 / stockLen;
+  const minPart = Math.min(...parts.map(p => p.len));
+
+  bar.cuts.forEach((cut, ci) => {
+    if (ci > 0 && kerf > 0) {
+      const kw = Math.max(kerf * scale, 1.5);
+      const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      r.setAttribute('x', x); r.setAttribute('y', 0);
+      r.setAttribute('width', kw); r.setAttribute('height', 36);
+      r.setAttribute('fill', '#1a1a18');
+      svg.appendChild(r); x += kw;
+    }
+    const w = cut.length * scale;
+    const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    r.setAttribute('x', x); r.setAttribute('y', 0);
+    r.setAttribute('width', w); r.setAttribute('height', 36);
+    r.setAttribute('fill', COLORS[cut.part_index % COLORS.length]);
+    r.setAttribute('rx', '2');
+    svg.appendChild(r);
+    if (w > 50) {
+      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', x + w / 2); t.setAttribute('y', 22);
+      t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('fill', 'rgba(255,255,255,0.9)');
+      t.setAttribute('font-size', '13');
+      t.setAttribute('font-family', 'system-ui,sans-serif');
+      t.setAttribute('font-weight', '500');
+      t.textContent = cut.length + '"';
+      svg.appendChild(t);
+    }
+    x += w;
+  });
+
+  if (bar.waste > 0.001) {
+    const ww = bar.waste * scale;
+    const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    r.setAttribute('x', x); r.setAttribute('y', 0);
+    r.setAttribute('width', ww); r.setAttribute('height', 36);
+    r.setAttribute('fill', bar.waste < minPart ? '#e8c0a0' : '#d8ead8');
+    r.setAttribute('rx', '2');
+    svg.appendChild(r);
+    if (ww > 40) {
+      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', x + ww / 2); t.setAttribute('y', 22);
+      t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('fill', bar.waste < minPart ? '#7a3a10' : '#2a6a2a');
+      t.setAttribute('font-size', '12');
+      t.setAttribute('font-family', 'system-ui,sans-serif');
+      t.textContent = bar.waste.toFixed(2) + '"';
+      svg.appendChild(t);
+    }
+  }
+
+  return svg;
+}
+
+function renderGroupedBars(bars, stockLen, kerf, container) {
+  const groups = groupBars(bars);
+  const minPart = Math.min(...parts.map(p => p.len));
+
+  groups.forEach(({bar, count}) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'bar-group';
+
+    const cutDesc = bar.cuts.map(c => c.length + '"').join(' + ');
+    const wasteNote = bar.waste < minPart && bar.waste > 0.001 ? ' (unusable)' : '';
+    const countLabel = count > 1
+      ? `<span class="bar-group-count">${count} bars</span> each: ${cutDesc}, waste: ${bar.waste.toFixed(3)}"${wasteNote}`
+      : `<span class="bar-group-count">1 bar</span>: ${cutDesc}, waste: ${bar.waste.toFixed(3)}"${wasteNote}`;
+
+    wrap.innerHTML = `<div class="bar-group-label">${countLabel}</div>`;
+    wrap.appendChild(renderBarSvg(bar, stockLen, kerf));
+    container.appendChild(wrap);
+  });
+}
+
+function renderLegend(kerf) {
+  const legendEl = document.getElementById('legend');
+  legendEl.innerHTML = '';
+  parts.forEach((p, i) => {
+    legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:${COLORS[i % COLORS.length]}"></span>${p.len}" parts</span>`;
+  });
+  legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#d8ead8"></span>usable drop</span>`;
+  legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#e8c0a0"></span>unusable drop</span>`;
+  if (kerf > 0) legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#1a1a18"></span>kerf</span>`;
+}
+
+// --- Main solve ---
+
+function solve() {
+  if (!wasmReady || !parts.length) { setStatus('Add at least one part.'); return; }
+
+  const stockLen = parseFloat(document.getElementById('stockLen').value);
+  const kerf = parseFloat(document.getElementById('kerf').value) || 0;
+
+  const config = {
+    stock_length: stockLen,
+    kerf: kerf,
+    parts: parts.map(p => ({length: p.len, qty: p.qty})),
+    solve_seconds: parseFloat(document.getElementById('solveSec').value) || 5,
+    max_extra_bars: parseInt(document.getElementById('maxExtraBars').value) || 3,
+    suggest_seconds: parseFloat(document.getElementById('suggestSec').value) || 5,
+  };
+
+  document.getElementById('solveBtn').disabled = true;
+  setStatus('Solving...');
+
+  setTimeout(() => {
+    const t0 = performance.now();
+    try {
+      const resultJson = optimize_json(JSON.stringify(config));
+      const result = JSON.parse(resultJson);
+      const elapsed = (performance.now() - t0).toFixed(1);
+
+      setStatus(`Solved in ${elapsed}ms — ${result.stats.patterns_generated} patterns, ${result.stats.solve_method}`);
+      showComparison(result);
+      showResults(result, stockLen, kerf);
+      showSuggestions(result, stockLen, kerf);
+    } catch (e) {
+      setStatus('Error: ' + e);
+    }
+    document.getElementById('solveBtn').disabled = false;
+  }, 10);
+}
+
+function showComparison(result) {
+  const {stats, naive} = result;
+  const card = document.getElementById('comparisonCard');
+  const body = document.getElementById('comparisonBody');
+
+  const barsSaved = naive.total_bars - stats.total_bars;
+  const wasteSaved = naive.total_waste - stats.total_waste;
+
+  body.innerHTML = `
+    <table class="compare-table">
+      <tr>
+        <th></th>
+        <th class="val">Bars</th>
+        <th class="val">Efficiency</th>
+        <th class="val">Waste</th>
+      </tr>
+      <tr>
+        <td>Naive (single-size cuts)</td>
+        <td class="val dim">${naive.total_bars}</td>
+        <td class="val dim">${naive.efficiency_pct.toFixed(1)}%</td>
+        <td class="val dim">${naive.total_waste.toFixed(1)}"</td>
+      </tr>
+      <tr>
+        <td>Optimized (mixed cuts)</td>
+        <td class="val good">${stats.total_bars}</td>
+        <td class="val good">${stats.efficiency_pct.toFixed(1)}%</td>
+        <td class="val good">${stats.total_waste.toFixed(1)}"</td>
+      </tr>
+    </table>
+    <div class="compare-savings">Saves ${barsSaved} bar${barsSaved !== 1 ? 's' : ''} and ${wasteSaved.toFixed(1)}" of waste vs. naive approach</div>
+    <div class="naive-breakdown">Naive breakdown: ${naive.per_part.map(p =>
+      `<span>${p.length}" &times; ${p.qty}: ${p.per_bar}/bar, ${p.bars_needed} bar${p.bars_needed !== 1 ? 's' : ''} (${p.waste_per_bar.toFixed(1)}" waste/bar)</span>`
+    ).join('')}</div>
+  `;
+
+  card.style.display = '';
+}
+
+function showResults(result, stockLen, kerf) {
+  const {bars, stats} = result;
+
+  document.getElementById('statsGrid').innerHTML = `
+    <div class="stat"><div class="stat-label">Bars of stock</div><div class="stat-val">${stats.total_bars}</div></div>
+    <div class="stat"><div class="stat-label">Efficiency</div><div class="stat-val ${stats.efficiency_pct >= 90 ? 'good' : 'warn'}">${stats.efficiency_pct.toFixed(1)}%</div></div>
+    <div class="stat"><div class="stat-label">Total waste</div><div class="stat-val warn">${stats.total_waste.toFixed(3)}"</div></div>
+    <div class="stat"><div class="stat-label">Parts cut</div><div class="stat-val">${stats.total_parts_cut}</div></div>
+  `;
+
+  const vizEl = document.getElementById('visualization');
+  vizEl.innerHTML = '';
+  renderGroupedBars(bars, stockLen, kerf, vizEl);
+  renderLegend(kerf);
+
+  document.getElementById('resultsCard').style.display = '';
+}
+
+// --- Suggestions ---
+
+function showSuggestions(result, stockLen, kerf) {
+  const card = document.getElementById('suggestionsCard');
+  const body = document.getElementById('suggestionsBody');
+  body.innerHTML = '';
+
+  if (!result.suggestions || result.suggestions.length === 0) {
+    card.style.display = 'none';
+    return;
+  }
+
+  result.suggestions.forEach(sg => {
+    const div = document.createElement('div');
+    div.className = 'suggestion';
+
+    const deltas = [];
+    sg.extra.forEach((e, i) => {
+      if (e > 0) deltas.push(`+${e} of ${parts[i].len}"`);
+      else if (e < 0) deltas.push(`${e} of ${parts[i].len}"`);
+    });
+
+    const eb = sg.extra_bars;
+    const barNote = eb === 0 ? `${sg.total_bars} bars (same count)` :
+                    eb > 0 ? `${sg.total_bars} bars (+${eb})` :
+                    `${sg.total_bars} bars (${eb})`;
+
+    const hasDeferred = sg.extra.some(e => e < 0);
+    const hasExtra = sg.extra.some(e => e > 0);
+    let actionText;
+    if (hasDeferred && !hasExtra) actionText = `Defer ${deltas.join(', ')}`;
+    else if (hasExtra && !hasDeferred) actionText = `Make ${deltas.join(', ')} extra`;
+    else actionText = `Adjust: ${deltas.join(', ')}`;
+
+    div.innerHTML = `
+      <div class="suggestion-header">
+        <span class="suggestion-title">${barNote} — ${sg.efficiency_pct.toFixed(1)}% efficiency</span>
+        <span class="suggestion-toggle">click to expand</span>
+      </div>
+      <div class="suggestion-detail">${actionText} — waste: ${sg.total_waste.toFixed(2)}" (was ${result.stats.total_waste.toFixed(2)}")</div>
+      <div class="suggestion-breakdown"></div>
+    `;
+
+    let expanded = false;
+    div.addEventListener('click', () => {
+      const breakdown = div.querySelector('.suggestion-breakdown');
+      const toggle = div.querySelector('.suggestion-toggle');
+      expanded = !expanded;
+      breakdown.classList.toggle('open', expanded);
+      toggle.textContent = expanded ? 'click to collapse' : 'click to expand';
+
+      if (expanded && breakdown.children.length === 0) {
+        // Solve with suggestion quantities (no suggestions search needed)
+        const config = {
+          stock_length: stockLen,
+          kerf: kerf,
+          parts: sg.quantities.map((q, i) => ({length: parts[i].len, qty: q})),
+          max_extra_bars: 0,
+          suggest_seconds: 0,
+        };
+        try {
+          const res = JSON.parse(optimize_json(JSON.stringify(config)));
+          renderGroupedBars(res.bars, stockLen, kerf, breakdown);
+        } catch (e) {
+          breakdown.textContent = 'Error: ' + e;
+        }
+      }
+    });
+
+    body.appendChild(div);
+  });
+
+  card.style.display = '';
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+loadFromURL();
+</script>
+</body>
+</html>
