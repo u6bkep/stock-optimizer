@@ -27,8 +27,9 @@ input:focus{border-color:#5a7fc9;box-shadow:0 0 0 2px rgba(90,127,201,0.15)}
 .stat-val{font-size:20px;font-weight:600;color:#1a1a18}
 .stat-val.good{color:#2d7a45}
 .stat-val.warn{color:#b06020}
-.bar-container{margin-bottom:18px}
-.bar-label{font-size:12px;color:#666;margin-bottom:4px;font-weight:500}
+.bar-group{margin-bottom:18px}
+.bar-group-label{font-size:12px;color:#666;margin-bottom:4px;font-weight:500}
+.bar-group-count{font-weight:600;color:#1a1a18}
 svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
 .legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:11px;color:#555}
 .legend-item{display:flex;align-items:center;gap:4px}
@@ -36,6 +37,14 @@ svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
 #status{font-size:13px;color:#888;margin-top:8px;min-height:18px}
 .section-title{font-size:13px;font-weight:600;color:#555;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em}
 .add-part-row{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+.suggestion{background:#f0f5ff;border:0.5px solid #c0d0e8;border-radius:8px;padding:12px 14px;margin-bottom:8px;cursor:pointer;transition:background 0.15s}
+.suggestion:hover{background:#e4ecfa}
+.suggestion-header{display:flex;justify-content:space-between;align-items:center}
+.suggestion-title{font-size:13px;font-weight:600;color:#3a6bc9}
+.suggestion-toggle{font-size:11px;color:#888}
+.suggestion-detail{font-size:12px;color:#555;margin-top:4px}
+.suggestion-breakdown{margin-top:10px;padding-top:10px;border-top:0.5px solid #c0d0e8;display:none}
+.suggestion-breakdown.open{display:block}
 </style>
 </head>
 <body>
@@ -50,6 +59,18 @@ svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
     <div class="field">
       <label>Kerf (in)</label>
       <input type="number" id="kerf" value="0.125" min="0" step="0.0625">
+    </div>
+    <div class="field">
+      <label>Solve budget (s)</label>
+      <input type="number" id="solveSec" value="5" min="0.1" step="0.5">
+    </div>
+    <div class="field">
+      <label>Extra bars to try</label>
+      <input type="number" id="maxExtraBars" value="3" min="0" step="1">
+    </div>
+    <div class="field">
+      <label>Suggestion budget (s)</label>
+      <input type="number" id="suggestSec" value="5" min="0" step="0.5">
     </div>
   </div>
   <div class="section-title">Parts needed</div>
@@ -66,7 +87,7 @@ svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
     <button class="btn-sm" id="addBtn">+ Add</button>
   </div>
   <div style="margin-top:1.25rem;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-    <button class="btn-primary" id="solveBtn">Optimize cuts</button>
+    <button class="btn-primary" id="solveBtn" disabled>Loading WASM...</button>
     <div id="status"></div>
   </div>
 </div>
@@ -78,11 +99,28 @@ svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
   <div class="legend" id="legend"></div>
 </div>
 
-<script>
+<div class="card" id="suggestionsCard" style="display:none">
+  <div class="section-title">Overproduction suggestions</div>
+  <div id="suggestionsBody"></div>
+</div>
+
+<script type="module">
+import init, { optimize_json } from './pkg/stock_optimizer.js';
+
 const COLORS = ['#4a7fd4','#5ba85c','#d47a4a','#a855a0','#d4b94a','#4ab8d4','#d44a6a','#7a9e4a','#d4664a','#4a9ed4'];
 
 let parts = [];
 let nextId = 0;
+let wasmReady = false;
+
+async function loadWasm() {
+  await init();
+  wasmReady = true;
+  const btn = document.getElementById('solveBtn');
+  btn.disabled = false;
+  btn.textContent = 'Optimize cuts';
+}
+loadWasm();
 
 function addPart(len, qty) {
   len = len || parseFloat(document.getElementById('newLen').value);
@@ -107,9 +145,9 @@ function renderParts() {
     row.className = 'parts-row';
     row.innerHTML = `<span style="min-width:20px;color:#888;font-size:12px">${i+1}.</span>
       <input type="number" value="${p.len}" min="0.1" step="0.125" style="max-width:110px" data-idx="${i}" data-field="len">
-      <span style="font-size:12px;color:#888">in ×</span>
+      <span style="font-size:12px;color:#888">in &times;</span>
       <input type="number" value="${p.qty}" min="1" step="1" style="max-width:70px" data-idx="${i}" data-field="qty">
-      <button class="btn-sm" data-remove="${p.id}" style="color:#c04040;border-color:#e8c0c0">✕</button>`;
+      <button class="btn-sm" data-remove="${p.id}" style="color:#c04040;border-color:#e8c0c0">&times;</button>`;
     el.appendChild(row);
   });
 }
@@ -119,7 +157,7 @@ function syncURL() {
   const kerf = document.getElementById('kerf').value;
   const ps = parts.map(p => `${p.len}x${p.qty}`).join(',');
   const params = new URLSearchParams({stockLen, kerf, parts: ps});
-  history.replaceState(null,'','?'+params.toString());
+  history.replaceState(null, '', '?' + params.toString());
 }
 
 function loadFromURL() {
@@ -152,279 +190,252 @@ document.getElementById('partsList').addEventListener('click', e => {
   if (id !== undefined) removePart(+id);
 });
 
-// --- Generate all valid cut patterns for given part sizes and stock length ---
-// A pattern is an array of counts, one per part type, that fits in one bar.
-function genPatterns(lengths, stockLen, kerf) {
-  const n = lengths.length;
-  const patterns = [];
-  // remaining: space left in bar. totalPieces: pieces placed so far (to count kerfs).
-  function recurse(idx, remaining, totalPieces, counts) {
-    if (idx === n) {
-      if (totalPieces > 0) patterns.push([...counts]);
-      return;
-    }
-    // Each additional piece costs length + kerf (kerf is a saw cut before each piece after the first)
-    const pieceSpace = lengths[idx] + (totalPieces > 0 ? kerf : 0);
-    const maxK = Math.floor(remaining / pieceSpace);
-    // Try placing 0..maxK of this part type, consuming space greedily
-    let rem = remaining;
-    for (let k = 0; k <= maxK; k++) {
-      counts[idx] = k;
-      recurse(idx + 1, rem, totalPieces + k, counts);
-      // add one more piece of this type
-      rem -= (totalPieces + k > 0 ? kerf : 0) + lengths[idx];
-    }
-    counts[idx] = 0;
-  }
-  recurse(0, stockLen, 0, new Array(n).fill(0));
-  return patterns;
+// --- Bar pattern grouping ---
+
+function barKey(bar) {
+  return bar.cuts.map(c => `${c.part_index}:${c.length}`).join(',');
 }
 
-// --- Branch-and-bound solver ---
-// Finds minimum bars (allowing overage on qty — cuts >= demand).
-function bnbSolve(patterns, demand, stockLen, lengths, kerf) {
-  const n = demand.length;
-  let bestBars = Infinity;
-  let bestAssignment = null;
-
-  // Upper bound via greedy BFD
-  const bfdResult = bfd(lengths, demand, stockLen, kerf);
-  bestBars = bfdResult.length;
-  bestAssignment = bfdResult.map(b => b.patternIdx);
-
-  // Sort patterns by "value" — total material used descending
-  const scored = patterns.map((p, i) => {
-    const used = p.reduce((s,c,j)=>s+c*lengths[j],0) + Math.max(0,(p.reduce((s,c)=>s+(c>0?1:0),0)-1))*kerf;
-    return {p, i, used};
-  }).sort((a,b)=>b.used-a.used);
-  const sortedPatterns = scored.map(s=>s.p);
-
-  const chosen = []; // pattern indices chosen so far
-
-  function remaining(filled) {
-    return demand.map((d,i) => Math.max(0, d - filled[i]));
-  }
-
-  function lowerBound(rem) {
-    // Simple lower bound: max over each part type of ceil(remaining/max that fits per bar)
-    let lb = 0;
-    for (let i = 0; i < n; i++) {
-      if (rem[i] <= 0) continue;
-      const maxPerBar = Math.max(...sortedPatterns.map(p=>p[i]));
-      if (maxPerBar === 0) return Infinity;
-      lb = Math.max(lb, Math.ceil(rem[i] / maxPerBar));
-    }
-    return lb;
-  }
-
-  function search(filled, barsUsed) {
-    const rem = remaining(filled);
-    if (rem.every(r => r <= 0)) {
-      if (barsUsed < bestBars) {
-        bestBars = barsUsed;
-        bestAssignment = [...chosen];
-        console.log(`[B&B] new best: ${bestBars} bars`);
-      }
-      return;
-    }
-    if (barsUsed + lowerBound(rem) >= bestBars) return; // prune
-
-    // Pick the part type with highest remaining demand to branch on
-    const pivotIdx = rem.indexOf(Math.max(...rem));
-
-    for (const p of sortedPatterns) {
-      if (p[pivotIdx] === 0) continue; // must make progress on pivot
-      chosen.push(p);
-      const newFilled = filled.map((f,i) => f + p[i]);
-      search(newFilled, barsUsed + 1);
-      chosen.pop();
-    }
-  }
-
-  search(new Array(n).fill(0), 0);
-  return {bars: bestBars, assignment: bestAssignment};
-}
-
-// BFD returning pattern indices
-function bfd(lengths, demand, stockLen, kerf) {
-  const allParts = [];
-  demand.forEach((qty, i) => { for (let j=0; j<qty; j++) allParts.push(i); });
-  allParts.sort((a,b) => lengths[b]-lengths[a]);
-
-  const bars = [];
-  for (const pi of allParts) {
-    let bestBar = null, bestRem = Infinity;
-    for (const bar of bars) {
-      const needed = (bar.counts.some(c=>c>0) ? kerf : 0) + lengths[pi];
-      const rem = bar.remaining - needed;
-      if (rem >= -1e-9 && rem < bestRem) { bestRem = rem; bestBar = bar; }
-    }
-    if (bestBar) {
-      bestBar.counts[pi]++;
-      bestBar.remaining -= ((bestBar.counts.some((c,i)=>c>0&&i!==pi)||bestBar.counts[pi]>1) ? kerf : 0) + lengths[pi];
+function groupBars(bars) {
+  const groups = [];
+  const seen = new Map();
+  for (const bar of bars) {
+    const key = barKey(bar);
+    if (seen.has(key)) {
+      seen.get(key).count++;
     } else {
-      const counts = new Array(lengths.length).fill(0);
-      counts[pi] = 1;
-      bars.push({counts, remaining: stockLen - lengths[pi]});
+      const group = { bar, count: 1 };
+      seen.set(key, group);
+      groups.push(group);
     }
   }
-  return bars;
+  return groups;
 }
 
-function solve() {
-  const stockLen = parseFloat(document.getElementById('stockLen').value);
-  const kerf = parseFloat(document.getElementById('kerf').value)||0;
-  if (!parts.length) { setStatus('Add at least one part.'); return; }
+// --- SVG rendering ---
 
-  const lengths = parts.map(p=>p.len);
-  const demand = parts.map(p=>p.qty);
+function renderBarSvg(bar, stockLen, kerf) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'bar-vis');
+  svg.setAttribute('viewBox', '0 0 1000 36');
+  svg.setAttribute('preserveAspectRatio', 'none');
 
-  const oversized = lengths.filter(l=>l>stockLen);
-  if (oversized.length) { setStatus(`Error: part ${oversized[0]}" exceeds stock ${stockLen}"`); return; }
+  let x = 0;
+  const scale = 1000 / stockLen;
+  const minPart = Math.min(...parts.map(p => p.len));
 
-  document.getElementById('solveBtn').disabled = true;
-  setStatus('Generating patterns...');
-
-  setTimeout(() => {
-    const t0 = performance.now();
-
-    console.log('=== Bar Stock Optimizer v2 ===');
-    console.log(`Stock: ${stockLen}"  Kerf: ${kerf}"  Parts: ${lengths.map((l,i)=>l+'"x'+demand[i]).join(', ')}`);
-
-    console.log('[patterns] generating...');
-    const tp0 = performance.now();
-    const patterns = genPatterns(lengths, stockLen, kerf);
-    console.log(`[patterns] done in ${(performance.now()-tp0).toFixed(1)}ms — ${patterns.length} patterns`);
-    if (!patterns.length) { setStatus('Error: no valid patterns found.'); document.getElementById('solveBtn').disabled=false; return; }
-    console.log('[patterns] samples:', patterns.slice(0,5).map(p=>p.map((c,i)=>c?`${c}x${lengths[i]}"`:'').filter(Boolean).join('+')));
-
-    setStatus('Solving...');
-    setTimeout(() => {
-      const {bars, assignment} = bnbSolve(patterns, demand, stockLen, lengths, kerf);
-
-      // Reconstruct bar objects from assignment
-      const result = assignment.map(p => {
-        const counts = p;
-        const totalParts = counts.reduce((s,c)=>s+c,0);
-        const used = counts.reduce((s,c,i)=>s+c*lengths[i],0) + Math.max(0,(totalParts-1))*kerf;
-        const waste = stockLen - used;
-        const cuts = [];
-        counts.forEach((c,i) => { for(let j=0;j<c;j++) cuts.push({len:lengths[i],colorIdx:i%COLORS.length}); });
-        cuts.sort((a,b)=>b.len-a.len);
-        return {cuts, waste, counts};
-      });
-
-      const elapsed = (performance.now()-t0).toFixed(1);
-      const totalWaste = result.reduce((s,b)=>s+b.waste,0);
-      const minPart = Math.min(...lengths);
-      const unusable = result.filter(b=>b.waste<minPart&&b.waste>0.001).reduce((s,b)=>s+b.waste,0);
-      const eff = (result.reduce((s,b)=>s+b.cuts.reduce((ss,c)=>ss+c.len,0),0)/(bars*stockLen)*100).toFixed(1);
-
-      console.log(`[result] ${bars} bars, efficiency: ${eff}%, total waste: ${totalWaste.toFixed(3)}", time: ${elapsed}ms`);
-      console.log('[result] layout:', result.map((b,i)=>`bar${i+1}:[${b.cuts.map(c=>c.len+'"').join(',')}] drop:${b.waste.toFixed(3)}"`).join('  '));
-
-      setStatus(`Solved in ${elapsed}ms — ${patterns.length} patterns, branch-and-bound`);
-      showResults(result, stockLen, kerf, minPart);
-      document.getElementById('solveBtn').disabled = false;
-    }, 10);
-  }, 10);
-}
-
-function showResults(bars, stockLen, kerf, minPart) {
-  const totalBars = bars.length;
-  const totalWaste = bars.reduce((s,b)=>s+b.waste,0);
-  const unusableWaste = bars.filter(b=>b.waste<minPart&&b.waste>0.001).reduce((s,b)=>s+b.waste,0);
-  const eff = (bars.reduce((s,b)=>s+b.cuts.reduce((ss,c)=>ss+c.len,0),0)/(totalBars*stockLen)*100).toFixed(1);
-
-  document.getElementById('statsGrid').innerHTML = `
-    <div class="stat"><div class="stat-label">Bars of stock</div><div class="stat-val">${totalBars}</div></div>
-    <div class="stat"><div class="stat-label">Efficiency</div><div class="stat-val ${parseFloat(eff)>=90?'good':'warn'}">${eff}%</div></div>
-    <div class="stat"><div class="stat-label">Total waste</div><div class="stat-val warn">${totalWaste.toFixed(3)}"</div></div>
-    <div class="stat"><div class="stat-label">Unusable drops</div><div class="stat-val">${unusableWaste.toFixed(3)}"</div></div>
-  `;
-
-  const vizEl = document.getElementById('visualization');
-  vizEl.innerHTML = '';
-
-  bars.forEach((bar, bi) => {
-    const wrap = document.createElement('div');
-    wrap.className = 'bar-container';
-    let lbl = `Bar ${bi+1} — ${bar.cuts.length} cut${bar.cuts.length!==1?'s':''}, waste: ${bar.waste.toFixed(3)}"`;
-    if (bar.waste < minPart && bar.waste > 0.001) lbl += ' (unusable)';
-    wrap.innerHTML = `<div class="bar-label">${lbl}</div>`;
-
-    const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
-    svg.setAttribute('class','bar-vis');
-    svg.setAttribute('viewBox','0 0 1000 36');
-    svg.setAttribute('preserveAspectRatio','none');
-
-    let x = 0;
-    const scale = 1000/stockLen;
-
-    bar.cuts.forEach((cut,ci) => {
-      if (ci > 0 && kerf > 0) {
-        const kw = Math.max(kerf*scale, 1.5);
-        const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
-        r.setAttribute('x',x); r.setAttribute('y',0);
-        r.setAttribute('width',kw); r.setAttribute('height',36);
-        r.setAttribute('fill','#1a1a18');
-        svg.appendChild(r); x += kw;
-      }
-      const w = cut.len*scale;
-      const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
-      r.setAttribute('x',x); r.setAttribute('y',0);
-      r.setAttribute('width',w); r.setAttribute('height',36);
-      r.setAttribute('fill',COLORS[cut.colorIdx]);
-      r.setAttribute('rx','2');
-      svg.appendChild(r);
-      if (w > 50) {
-        const t = document.createElementNS('http://www.w3.org/2000/svg','text');
-        t.setAttribute('x',x+w/2); t.setAttribute('y',22);
-        t.setAttribute('text-anchor','middle');
-        t.setAttribute('fill','rgba(255,255,255,0.9)');
-        t.setAttribute('font-size','13');
-        t.setAttribute('font-family','system-ui,sans-serif');
-        t.setAttribute('font-weight','500');
-        t.textContent = cut.len+'"';
-        svg.appendChild(t);
-      }
-      x += w;
-    });
-
-    if (bar.waste > 0.001) {
-      const ww = bar.waste*scale;
-      const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
-      r.setAttribute('x',x); r.setAttribute('y',0);
-      r.setAttribute('width',ww); r.setAttribute('height',36);
-      r.setAttribute('fill', bar.waste < minPart ? '#e8c0a0' : '#d8ead8');
-      r.setAttribute('rx','2');
-      svg.appendChild(r);
-      if (ww > 40) {
-        const t = document.createElementNS('http://www.w3.org/2000/svg','text');
-        t.setAttribute('x',x+ww/2); t.setAttribute('y',22);
-        t.setAttribute('text-anchor','middle');
-        t.setAttribute('fill', bar.waste < minPart ? '#7a3a10' : '#2a6a2a');
-        t.setAttribute('font-size','12');
-        t.setAttribute('font-family','system-ui,sans-serif');
-        t.textContent = bar.waste.toFixed(2)+'"';
-        svg.appendChild(t);
-      }
+  bar.cuts.forEach((cut, ci) => {
+    if (ci > 0 && kerf > 0) {
+      const kw = Math.max(kerf * scale, 1.5);
+      const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      r.setAttribute('x', x); r.setAttribute('y', 0);
+      r.setAttribute('width', kw); r.setAttribute('height', 36);
+      r.setAttribute('fill', '#1a1a18');
+      svg.appendChild(r); x += kw;
     }
-
-    wrap.appendChild(svg);
-    vizEl.appendChild(wrap);
+    const w = cut.length * scale;
+    const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    r.setAttribute('x', x); r.setAttribute('y', 0);
+    r.setAttribute('width', w); r.setAttribute('height', 36);
+    r.setAttribute('fill', COLORS[cut.part_index % COLORS.length]);
+    r.setAttribute('rx', '2');
+    svg.appendChild(r);
+    if (w > 50) {
+      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', x + w / 2); t.setAttribute('y', 22);
+      t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('fill', 'rgba(255,255,255,0.9)');
+      t.setAttribute('font-size', '13');
+      t.setAttribute('font-family', 'system-ui,sans-serif');
+      t.setAttribute('font-weight', '500');
+      t.textContent = cut.length + '"';
+      svg.appendChild(t);
+    }
+    x += w;
   });
 
+  if (bar.waste > 0.001) {
+    const ww = bar.waste * scale;
+    const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    r.setAttribute('x', x); r.setAttribute('y', 0);
+    r.setAttribute('width', ww); r.setAttribute('height', 36);
+    r.setAttribute('fill', bar.waste < minPart ? '#e8c0a0' : '#d8ead8');
+    r.setAttribute('rx', '2');
+    svg.appendChild(r);
+    if (ww > 40) {
+      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', x + ww / 2); t.setAttribute('y', 22);
+      t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('fill', bar.waste < minPart ? '#7a3a10' : '#2a6a2a');
+      t.setAttribute('font-size', '12');
+      t.setAttribute('font-family', 'system-ui,sans-serif');
+      t.textContent = bar.waste.toFixed(2) + '"';
+      svg.appendChild(t);
+    }
+  }
+
+  return svg;
+}
+
+function renderGroupedBars(bars, stockLen, kerf, container) {
+  const groups = groupBars(bars);
+  const minPart = Math.min(...parts.map(p => p.len));
+
+  groups.forEach(({bar, count}) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'bar-group';
+
+    const cutDesc = bar.cuts.map(c => c.length + '"').join(' + ');
+    const wasteNote = bar.waste < minPart && bar.waste > 0.001 ? ' (unusable)' : '';
+    const countLabel = count > 1
+      ? `<span class="bar-group-count">${count} bars</span> each: ${cutDesc}, waste: ${bar.waste.toFixed(3)}"${wasteNote}`
+      : `<span class="bar-group-count">1 bar</span>: ${cutDesc}, waste: ${bar.waste.toFixed(3)}"${wasteNote}`;
+
+    wrap.innerHTML = `<div class="bar-group-label">${countLabel}</div>`;
+    wrap.appendChild(renderBarSvg(bar, stockLen, kerf));
+    container.appendChild(wrap);
+  });
+}
+
+function renderLegend(kerf) {
   const legendEl = document.getElementById('legend');
   legendEl.innerHTML = '';
-  parts.forEach((p,i) => {
-    legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:${COLORS[i%COLORS.length]}"></span>${p.len}" parts</span>`;
+  parts.forEach((p, i) => {
+    legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:${COLORS[i % COLORS.length]}"></span>${p.len}" parts</span>`;
   });
   legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#d8ead8"></span>usable drop</span>`;
   legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#e8c0a0"></span>unusable drop</span>`;
   if (kerf > 0) legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#1a1a18"></span>kerf</span>`;
+}
 
-  document.getElementById('resultsCard').style.display='';
+// --- Main solve ---
+
+function solve() {
+  if (!wasmReady || !parts.length) { setStatus('Add at least one part.'); return; }
+
+  const stockLen = parseFloat(document.getElementById('stockLen').value);
+  const kerf = parseFloat(document.getElementById('kerf').value) || 0;
+
+  const config = {
+    stock_length: stockLen,
+    kerf: kerf,
+    parts: parts.map(p => ({length: p.len, qty: p.qty})),
+    solve_seconds: parseFloat(document.getElementById('solveSec').value) || 5,
+    max_extra_bars: parseInt(document.getElementById('maxExtraBars').value) || 3,
+    suggest_seconds: parseFloat(document.getElementById('suggestSec').value) || 5,
+  };
+
+  document.getElementById('solveBtn').disabled = true;
+  setStatus('Solving...');
+
+  setTimeout(() => {
+    const t0 = performance.now();
+    try {
+      const resultJson = optimize_json(JSON.stringify(config));
+      const result = JSON.parse(resultJson);
+      const elapsed = (performance.now() - t0).toFixed(1);
+
+      setStatus(`Solved in ${elapsed}ms — ${result.stats.patterns_generated} patterns, ${result.stats.solve_method}`);
+      showResults(result, stockLen, kerf);
+      showSuggestions(result, stockLen, kerf);
+    } catch (e) {
+      setStatus('Error: ' + e);
+    }
+    document.getElementById('solveBtn').disabled = false;
+  }, 10);
+}
+
+function showResults(result, stockLen, kerf) {
+  const {bars, stats} = result;
+
+  document.getElementById('statsGrid').innerHTML = `
+    <div class="stat"><div class="stat-label">Bars of stock</div><div class="stat-val">${stats.total_bars}</div></div>
+    <div class="stat"><div class="stat-label">Efficiency</div><div class="stat-val ${stats.efficiency_pct >= 90 ? 'good' : 'warn'}">${stats.efficiency_pct.toFixed(1)}%</div></div>
+    <div class="stat"><div class="stat-label">Total waste</div><div class="stat-val warn">${stats.total_waste.toFixed(3)}"</div></div>
+    <div class="stat"><div class="stat-label">Parts cut</div><div class="stat-val">${stats.total_parts_cut}</div></div>
+  `;
+
+  const vizEl = document.getElementById('visualization');
+  vizEl.innerHTML = '';
+  renderGroupedBars(bars, stockLen, kerf, vizEl);
+  renderLegend(kerf);
+
+  document.getElementById('resultsCard').style.display = '';
+}
+
+// --- Suggestions ---
+
+function showSuggestions(result, stockLen, kerf) {
+  const card = document.getElementById('suggestionsCard');
+  const body = document.getElementById('suggestionsBody');
+  body.innerHTML = '';
+
+  if (!result.suggestions || result.suggestions.length === 0) {
+    card.style.display = 'none';
+    return;
+  }
+
+  result.suggestions.forEach(sg => {
+    const div = document.createElement('div');
+    div.className = 'suggestion';
+
+    const deltas = [];
+    sg.extra.forEach((e, i) => {
+      if (e > 0) deltas.push(`+${e} of ${parts[i].len}"`);
+      else if (e < 0) deltas.push(`${e} of ${parts[i].len}"`);
+    });
+
+    const eb = sg.extra_bars;
+    const barNote = eb === 0 ? `${sg.total_bars} bars (same count)` :
+                    eb > 0 ? `${sg.total_bars} bars (+${eb})` :
+                    `${sg.total_bars} bars (${eb})`;
+
+    const hasDeferred = sg.extra.some(e => e < 0);
+    const hasExtra = sg.extra.some(e => e > 0);
+    let actionText;
+    if (hasDeferred && !hasExtra) actionText = `Defer ${deltas.join(', ')}`;
+    else if (hasExtra && !hasDeferred) actionText = `Make ${deltas.join(', ')} extra`;
+    else actionText = `Adjust: ${deltas.join(', ')}`;
+
+    div.innerHTML = `
+      <div class="suggestion-header">
+        <span class="suggestion-title">${barNote} — ${sg.efficiency_pct.toFixed(1)}% efficiency</span>
+        <span class="suggestion-toggle">click to expand</span>
+      </div>
+      <div class="suggestion-detail">${actionText} — waste: ${sg.total_waste.toFixed(2)}" (was ${result.stats.total_waste.toFixed(2)}")</div>
+      <div class="suggestion-breakdown"></div>
+    `;
+
+    let expanded = false;
+    div.addEventListener('click', () => {
+      const breakdown = div.querySelector('.suggestion-breakdown');
+      const toggle = div.querySelector('.suggestion-toggle');
+      expanded = !expanded;
+      breakdown.classList.toggle('open', expanded);
+      toggle.textContent = expanded ? 'click to collapse' : 'click to expand';
+
+      if (expanded && breakdown.children.length === 0) {
+        // Solve with suggestion quantities (no suggestions search needed)
+        const config = {
+          stock_length: stockLen,
+          kerf: kerf,
+          parts: sg.quantities.map((q, i) => ({length: parts[i].len, qty: q})),
+          max_extra_bars: 0,
+          suggest_seconds: 0,
+        };
+        try {
+          const res = JSON.parse(optimize_json(JSON.stringify(config)));
+          renderGroupedBars(res.bars, stockLen, kerf, breakdown);
+        } catch (e) {
+          breakdown.textContent = 'Error: ' + e;
+        }
+      }
+    });
+
+    body.appendChild(div);
+  });
+
+  card.style.display = '';
 }
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }

@@ -1,6 +1,37 @@
-use std::time::{Duration, Instant};
-
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
+
+// Platform-agnostic time: uses performance.now() on WASM, std::time on native.
+#[derive(Clone, Copy)]
+struct Deadline(f64); // milliseconds since some epoch
+
+impl Deadline {
+    fn after_secs(secs: f64) -> Self {
+        Deadline(now_ms() + secs * 1000.0)
+    }
+
+    fn is_past(&self) -> bool {
+        now_ms() >= self.0
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        * 1000.0
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -10,12 +41,19 @@ pub struct Config {
     pub kerf: f64,
     /// Parts to cut: each entry is (length, quantity)
     pub parts: Vec<PartSpec>,
+    /// Time budget in seconds for the main solve (default: 5)
+    #[serde(default = "default_solve_seconds")]
+    pub solve_seconds: f64,
     /// Max extra bars to explore for overproduction suggestions (default: 3)
     #[serde(default = "default_max_extra_bars")]
     pub max_extra_bars: usize,
     /// Time budget in seconds for the suggestion search (default: 5)
     #[serde(default = "default_suggest_seconds")]
     pub suggest_seconds: f64,
+}
+
+fn default_solve_seconds() -> f64 {
+    5.0
 }
 
 fn default_max_extra_bars() -> usize {
@@ -32,6 +70,7 @@ impl Config {
             stock_length,
             kerf,
             parts,
+            solve_seconds: default_solve_seconds(),
             max_extra_bars: default_max_extra_bars(),
             suggest_seconds: default_suggest_seconds(),
         }
@@ -55,8 +94,8 @@ pub struct Solution {
 pub struct Suggestion {
     /// Adjusted quantities for each part type
     pub quantities: Vec<u32>,
-    /// How many extra of each part type vs. original demand
-    pub extra: Vec<u32>,
+    /// Delta vs. original demand per part type (positive = extra, negative = deferred)
+    pub extra: Vec<i32>,
     /// Number of bars needed
     pub total_bars: usize,
     /// Extra bars vs. baseline (0 = fits in same count, negative = saves bars)
@@ -106,7 +145,7 @@ pub fn optimize(config: &Config) -> Result<Solution, String> {
         return Err("No valid cutting patterns found".into());
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Deadline::after_secs(config.solve_seconds);
     let (assignment, exact) =
         bnb_solve(&patterns, &demand, config.stock_length, &lengths, config.kerf, deadline);
 
@@ -120,6 +159,7 @@ pub fn optimize(config: &Config) -> Result<Solution, String> {
         &lengths,
         config.kerf,
         stats.total_bars,
+        stats.efficiency_pct,
         config.max_extra_bars,
         config.suggest_seconds,
     );
@@ -170,11 +210,13 @@ fn compute_stats(bars: &[Bar], stock_length: f64, patterns_generated: usize, exa
     }
 }
 
-/// Find overproduction suggestions across a range of bar counts.
+/// Find suggestions by adjusting part counts both up and down.
 ///
-/// For each bar count from baseline to baseline + max_extra_bars, find the
-/// maximum overproduction of each part type that fits, then find the best
-/// combined overproduction. Reports one suggestion per bar count level.
+/// **Overproduction** (+ direction): for each bar count from baseline to
+/// baseline + max_extra_bars, find the maximum extra parts that fit.
+///
+/// **Underproduction** (- direction): try reducing each part type to see
+/// if deferring a few parts to another run saves bars / improves efficiency.
 fn find_suggestions(
     patterns: &[Pattern],
     demand: &[u32],
@@ -182,112 +224,104 @@ fn find_suggestions(
     lengths: &[f64],
     kerf: f64,
     baseline_bars: usize,
+    baseline_efficiency: f64,
     max_extra_bars: usize,
     suggest_seconds: f64,
 ) -> Vec<Suggestion> {
     let n = demand.len();
-    let deadline = Instant::now() + Duration::from_secs_f64(suggest_seconds);
+    let deadline = Deadline::after_secs(suggest_seconds);
     let mut suggestions: Vec<Suggestion> = Vec::new();
 
+    // --- Overproduction: search + direction ---
     for extra_bar in 0..=max_extra_bars {
         let target_bars = baseline_bars + extra_bar;
-
-        if Instant::now() >= deadline {
+        if deadline.is_past() {
             break;
         }
+        if let Some(s) = best_overproduction_at(
+            patterns, demand, stock_length, lengths, kerf,
+            target_bars, baseline_bars, deadline,
+        ) {
+            suggestions.push(s);
+        }
+    }
 
-        // Binary search per part type: max extras that fit in target_bars
-        let mut per_type_max = vec![0u32; n];
-        for i in 0..n {
-            if Instant::now() >= deadline {
+    // --- Underproduction: search - direction ---
+    // For each part type, try removing 1..N and see if we get fewer bars
+    // or better efficiency with fewer bars.
+    // Also try combined reductions.
+    let mut best_under: Option<Suggestion> = None;
+
+    for i in 0..n {
+        if deadline.is_past() {
+            break;
+        }
+        for delta in 1..=demand[i] {
+            if deadline.is_past() {
                 break;
             }
-            let total_capacity = target_bars as f64 * stock_length;
-            let current_material: f64 =
-                demand.iter().zip(lengths).map(|(&q, &l)| q as f64 * l).sum();
-            let upper = ((total_capacity - current_material) / lengths[i]).floor() as u32;
-            if upper == 0 {
-                continue;
+            let mut trial = demand.to_vec();
+            trial[i] -= delta;
+            // Skip if zero total parts
+            if trial.iter().all(|&q| q == 0) {
+                break;
             }
-
-            let (mut lo, mut hi) = (0u32, upper);
-            while lo < hi {
-                let mid = (lo + hi + 1) / 2;
-                let mut trial = demand.to_vec();
-                trial[i] += mid;
-                let (assignment, _) =
-                    bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
-                if assignment.len() <= target_bars {
-                    lo = mid;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            per_type_max[i] = lo;
-        }
-
-        // Now find the best combined overproduction at this bar count.
-        // Start with all per-type maxes and check if they fit together.
-        // If not, scale down iteratively.
-        let mut best_trial = demand.to_vec();
-        for i in 0..n {
-            best_trial[i] += per_type_max[i];
-        }
-
-        let (assignment, _) =
-            bnb_solve(patterns, &best_trial, stock_length, lengths, kerf, deadline);
-        if assignment.len() <= target_bars {
-            // All fit together
+            let (assignment, _) =
+                bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
             let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
-            let s = make_suggestion(&best_trial, demand, &bars, stock_length, baseline_bars);
-            if s.extra.iter().any(|&e| e > 0) {
-                suggestions.push(s);
-            }
-        } else {
-            // All-at-once doesn't fit. Greedy: add one part type at a time,
-            // starting from the type with the most material contribution.
-            let mut order: Vec<usize> = (0..n).filter(|&i| per_type_max[i] > 0).collect();
-            order.sort_by(|&a, &b| {
-                (per_type_max[b] as f64 * lengths[b])
-                    .partial_cmp(&(per_type_max[a] as f64 * lengths[a]))
-                    .unwrap()
-            });
+            let s = make_suggestion(&trial, demand, &bars, stock_length, baseline_bars);
 
-            let mut combined = demand.to_vec();
-            for &i in &order {
-                if Instant::now() >= deadline {
-                    break;
+            // Only interesting if it saves bars or improves efficiency
+            if s.total_bars < baseline_bars || s.efficiency_pct > baseline_efficiency + 0.5 {
+                let dominated = best_under.as_ref().is_some_and(|prev| {
+                    prev.total_bars <= s.total_bars && prev.efficiency_pct >= s.efficiency_pct
+                });
+                if !dominated {
+                    best_under = Some(s);
                 }
-                // Binary search how many of this type we can add on top of what's already in combined
-                let (mut lo, mut hi) = (0u32, per_type_max[i]);
-                while lo < hi {
-                    let mid = (lo + hi + 1) / 2;
-                    let mut trial = combined.clone();
-                    trial[i] += mid;
-                    let (assignment, _) =
-                        bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
-                    if assignment.len() <= target_bars {
-                        lo = mid;
-                    } else {
-                        hi = mid - 1;
-                    }
-                }
-                combined[i] += lo;
             }
 
-            let extra: Vec<u32> = combined.iter().zip(demand).map(|(&c, &d)| c - d).collect();
-            if extra.iter().any(|&e| e > 0) {
-                let (assignment, _) =
-                    bnb_solve(patterns, &combined, stock_length, lengths, kerf, deadline);
-                let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
-                let s = make_suggestion(&combined, demand, &bars, stock_length, baseline_bars);
-                suggestions.push(s);
+            // If removing more doesn't keep reducing bars, stop
+            if assignment.len() >= baseline_bars && delta > 1 {
+                break;
             }
         }
     }
 
-    // Remove entries with no extras
-    suggestions.retain(|s| s.extra.iter().any(|&e| e > 0));
+    // Try combined underproduction: reduce all types proportionally
+    // by the amount that the single-best reduction found
+    if !deadline.is_past() && n >= 2 {
+        // Try reducing each type by 1 simultaneously
+        let mut trial = demand.to_vec();
+        let mut any_reduced = false;
+        for i in 0..n {
+            if trial[i] > 1 {
+                trial[i] -= 1;
+                any_reduced = true;
+            }
+        }
+        if any_reduced && trial.iter().any(|&q| q > 0) {
+            let (assignment, _) =
+                bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
+            let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
+            let s = make_suggestion(&trial, demand, &bars, stock_length, baseline_bars);
+            if s.total_bars < baseline_bars || s.efficiency_pct > baseline_efficiency + 0.5 {
+                let dominated = best_under.as_ref().is_some_and(|prev| {
+                    prev.total_bars <= s.total_bars && prev.efficiency_pct >= s.efficiency_pct
+                });
+                if !dominated {
+                    best_under = Some(s);
+                }
+            }
+        }
+    }
+
+    if let Some(s) = best_under {
+        suggestions.push(s);
+    }
+
+    // Remove entries with no change
+    suggestions.retain(|s| s.extra.iter().any(|&e| e != 0));
 
     // Sort by efficiency descending
     suggestions.sort_by(|a, b| {
@@ -300,6 +334,109 @@ fn find_suggestions(
     suggestions.dedup_by(|a, b| a.quantities == b.quantities);
 
     suggestions
+}
+
+/// Find the best combined overproduction that fits in `target_bars` bars.
+fn best_overproduction_at(
+    patterns: &[Pattern],
+    demand: &[u32],
+    stock_length: f64,
+    lengths: &[f64],
+    kerf: f64,
+    target_bars: usize,
+    baseline_bars: usize,
+    deadline: Deadline,
+) -> Option<Suggestion> {
+    let n = demand.len();
+
+    // Binary search per part type: max extras that fit in target_bars
+    let mut per_type_max = vec![0u32; n];
+    for i in 0..n {
+        if deadline.is_past() {
+            break;
+        }
+        let total_capacity = target_bars as f64 * stock_length;
+        let current_material: f64 =
+            demand.iter().zip(lengths).map(|(&q, &l)| q as f64 * l).sum();
+        let upper = ((total_capacity - current_material) / lengths[i]).floor() as u32;
+        if upper == 0 {
+            continue;
+        }
+
+        let (mut lo, mut hi) = (0u32, upper);
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            let mut trial = demand.to_vec();
+            trial[i] += mid;
+            let (assignment, _) =
+                bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
+            if assignment.len() <= target_bars {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        per_type_max[i] = lo;
+    }
+
+    if per_type_max.iter().all(|&m| m == 0) {
+        return None;
+    }
+
+    // Try all per-type maxes combined
+    let mut best_trial = demand.to_vec();
+    for i in 0..n {
+        best_trial[i] += per_type_max[i];
+    }
+
+    let (assignment, _) =
+        bnb_solve(patterns, &best_trial, stock_length, lengths, kerf, deadline);
+    if assignment.len() <= target_bars {
+        let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
+        let s = make_suggestion(&best_trial, demand, &bars, stock_length, baseline_bars);
+        if s.extra.iter().any(|&e| e > 0) {
+            return Some(s);
+        }
+    }
+
+    // All-at-once doesn't fit. Greedy: add one part type at a time.
+    let mut order: Vec<usize> = (0..n).filter(|&i| per_type_max[i] > 0).collect();
+    order.sort_by(|&a, &b| {
+        (per_type_max[b] as f64 * lengths[b])
+            .partial_cmp(&(per_type_max[a] as f64 * lengths[a]))
+            .unwrap()
+    });
+
+    let mut combined = demand.to_vec();
+    for &i in &order {
+        if deadline.is_past() {
+            break;
+        }
+        let (mut lo, mut hi) = (0u32, per_type_max[i]);
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            let mut trial = combined.clone();
+            trial[i] += mid;
+            let (assignment, _) =
+                bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
+            if assignment.len() <= target_bars {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        combined[i] += lo;
+    }
+
+    let has_extra = combined.iter().zip(demand).any(|(&c, &d)| c > d);
+    if !has_extra {
+        return None;
+    }
+
+    let (assignment, _) =
+        bnb_solve(patterns, &combined, stock_length, lengths, kerf, deadline);
+    let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
+    Some(make_suggestion(&combined, demand, &bars, stock_length, baseline_bars))
 }
 
 fn make_suggestion(
@@ -316,7 +453,11 @@ fn make_suggestion(
         .map(|b| b.cuts.iter().map(|c| c.length).sum::<f64>())
         .sum();
     let efficiency = total_parts_material / (bar_count as f64 * stock_length) * 100.0;
-    let extra: Vec<u32> = trial.iter().zip(demand).map(|(&t, &d)| t - d).collect();
+    let extra: Vec<i32> = trial
+        .iter()
+        .zip(demand)
+        .map(|(&t, &d)| t as i32 - d as i32)
+        .collect();
 
     Suggestion {
         quantities: trial.to_vec(),
@@ -527,7 +668,7 @@ fn bnb_solve(
     stock_length: f64,
     lengths: &[f64],
     kerf: f64,
-    deadline: Instant,
+    deadline: Deadline,
 ) -> (Vec<Pattern>, bool) {
     let n = demand.len();
 
@@ -654,7 +795,7 @@ fn bnb_search(
     best_multiplicities: &mut Vec<u32>,
     used_bfd: &mut bool,
     max_from: &[Vec<u32>],
-    deadline: Instant,
+    deadline: Deadline,
     timed_out: &mut bool,
     nodes: &mut u64,
 ) {
@@ -663,7 +804,7 @@ fn bnb_search(
     }
 
     *nodes += 1;
-    if *nodes % 10_000 == 0 && Instant::now() >= deadline {
+    if *nodes % 10_000 == 0 && deadline.is_past() {
         *timed_out = true;
         return;
     }
@@ -755,6 +896,15 @@ fn build_bar(pattern: &Pattern, lengths: &[f64], stock_length: f64, kerf: f64) -
     Bar { cuts, used, waste }
 }
 
+/// WASM entry point: takes JSON config string, returns JSON solution string.
+#[wasm_bindgen]
+pub fn optimize_json(config_json: &str) -> Result<String, String> {
+    let config: Config =
+        serde_json::from_str(config_json).map_err(|e| format!("Invalid config: {e}"))?;
+    let solution = optimize(&config)?;
+    serde_json::to_string(&solution).map_err(|e| format!("Serialization error: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,6 +915,7 @@ mod tests {
             stock_length,
             kerf,
             parts,
+            solve_seconds: 5.0,
             max_extra_bars: 0,
             suggest_seconds: 0.0,
         }
@@ -844,6 +995,7 @@ mod tests {
             ]
         }"#;
         let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.solve_seconds, 5.0); // default applied
         assert_eq!(config.max_extra_bars, 3); // default applied
         assert_eq!(config.suggest_seconds, 5.0); // default applied
     }
