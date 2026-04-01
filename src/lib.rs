@@ -87,7 +87,30 @@ pub struct PartSpec {
 pub struct Solution {
     pub bars: Vec<Bar>,
     pub stats: Stats,
+    pub naive: NaiveSolution,
     pub suggestions: Vec<Suggestion>,
+}
+
+/// What you'd get cutting each bar with only one part size (no mixing).
+#[derive(Debug, Clone, Serialize)]
+pub struct NaiveSolution {
+    pub total_bars: usize,
+    pub efficiency_pct: f64,
+    pub total_waste: f64,
+    /// Breakdown per part type
+    pub per_part: Vec<NaivePartBreakdown>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NaivePartBreakdown {
+    pub length: f64,
+    pub qty: u32,
+    /// How many fit on one bar
+    pub per_bar: u32,
+    /// Bars needed for this part type
+    pub bars_needed: u32,
+    /// Waste per bar
+    pub waste_per_bar: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,9 +187,12 @@ pub fn optimize(config: &Config) -> Result<Solution, String> {
         config.suggest_seconds,
     );
 
+    let naive = compute_naive(config);
+
     Ok(Solution {
         bars,
         stats,
+        naive,
         suggestions,
     })
 }
@@ -207,6 +233,62 @@ fn compute_stats(bars: &[Bar], stock_length: f64, patterns_generated: usize, exa
         total_parts_cut: bars.iter().map(|b| b.cuts.len() as u32).sum(),
         patterns_generated,
         solve_method: method.into(),
+    }
+}
+
+/// Compute the naive solution: cut each bar with only one part size.
+fn compute_naive(config: &Config) -> NaiveSolution {
+    let mut per_part = Vec::new();
+    let mut total_bars: u32 = 0;
+    let mut total_parts_material: f64 = 0.0;
+    let mut total_waste: f64 = 0.0;
+
+    for p in &config.parts {
+        // How many of this part fit on one bar?
+        // k parts cost: k * length + (k-1) * kerf = k*(length+kerf) - kerf
+        // k <= (stock_length + kerf) / (length + kerf)
+        let per_bar = ((config.stock_length + config.kerf) / (p.length + config.kerf)).floor() as u32;
+        let per_bar = per_bar.max(1);
+        let bars_needed = (p.qty + per_bar - 1) / per_bar;
+        let full_bar_used = p.length * per_bar as f64 + config.kerf * (per_bar - 1) as f64;
+        let waste_per_bar = config.stock_length - full_bar_used;
+
+        // The last bar may be partial
+        let remaining = p.qty % per_bar;
+        let full_bars = if remaining == 0 { bars_needed } else { bars_needed - 1 };
+        let part_waste = waste_per_bar * full_bars as f64;
+        let last_bar_waste = if remaining > 0 {
+            let last_used = p.length * remaining as f64 + config.kerf * remaining.saturating_sub(1) as f64;
+            config.stock_length - last_used
+        } else {
+            0.0
+        };
+
+        per_part.push(NaivePartBreakdown {
+            length: p.length,
+            qty: p.qty,
+            per_bar,
+            bars_needed,
+            waste_per_bar,
+        });
+
+        total_bars += bars_needed;
+        total_parts_material += p.length * p.qty as f64;
+        total_waste += part_waste + last_bar_waste;
+    }
+
+    let total_stock = total_bars as f64 * config.stock_length;
+    let efficiency_pct = if total_stock > 0.0 {
+        total_parts_material / total_stock * 100.0
+    } else {
+        0.0
+    };
+
+    NaiveSolution {
+        total_bars: total_bars as usize,
+        efficiency_pct,
+        total_waste,
+        per_part,
     }
 }
 
