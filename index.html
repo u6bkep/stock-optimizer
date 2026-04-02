@@ -30,7 +30,13 @@ input:focus{border-color:#5a7fc9;box-shadow:0 0 0 2px rgba(90,127,201,0.15)}
 .bar-group{margin-bottom:18px}
 .bar-group-label{font-size:12px;color:#666;margin-bottom:4px;font-weight:500}
 .bar-group-count{font-weight:600;color:#1a1a18}
-svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
+.bar-vis{display:flex;width:100%;height:36px;border-radius:6px;overflow:hidden}
+.bar-seg{display:flex;align-items:center;justify-content:center;overflow:hidden;white-space:nowrap;font-size:12px;font-family:system-ui,sans-serif;font-weight:500;color:rgba(255,255,255,0.9);min-width:0}
+.bar-seg.waste{color:#6a5a4a}
+.bar-kerf{background:#1a1a18;flex-shrink:0}
+sup,sub{font-size:0.65em;line-height:0;position:relative;vertical-align:baseline}
+sup{top:-0.4em}
+sub{bottom:-0.25em}
 .legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:11px;color:#555}
 .legend-item{display:flex;align-items:center;gap:4px}
 .legend-dot{width:10px;height:10px;border-radius:2px;flex-shrink:0}
@@ -54,6 +60,19 @@ svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
 .compare-savings{margin-top:10px;font-size:13px;color:#2d7a45;font-weight:500}
 .naive-breakdown{margin-top:10px;font-size:12px;color:#666}
 .naive-breakdown span{display:inline-block;margin-right:14px}
+.cut-list-table{width:100%;border-collapse:collapse;font-size:14px}
+.cut-list-table th{text-align:left;font-size:11px;color:#888;font-weight:500;padding:8px 10px;border-bottom:0.5px solid #ddd}
+.cut-list-table td{padding:8px 10px;border-bottom:0.5px solid #eee}
+.cut-list-table .num{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+.cut-list-table .adjusted{color:#b06020;font-weight:600}
+.cut-list-note{font-size:12px;color:#b06020;margin-top:6px}
+.recent-job{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:0.5px solid #eee;cursor:pointer;border-radius:6px;transition:background 0.1s}
+.recent-job:last-child{border-bottom:none}
+.recent-job:hover{background:#f0f0ec}
+.recent-job-summary{font-size:13px;color:#1a1a18;flex:1}
+.recent-job-meta{font-size:11px;color:#999;margin-left:12px;white-space:nowrap}
+.recent-job-delete{color:#c04040;border:none;background:transparent;cursor:pointer;font-size:15px;padding:2px 6px;margin-left:8px;border-radius:4px}
+.recent-job-delete:hover{background:#f8e0e0}
 </style>
 </head>
 <body>
@@ -93,6 +112,10 @@ svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
       <label>Qty</label>
       <input type="number" id="newQty" value="4" min="1" step="1">
     </div>
+    <div class="field" style="min-width:80px;max-width:120px">
+      <label>Tolerance (in)</label>
+      <input type="number" id="newTol" value="0" min="0" step="0.0625">
+    </div>
     <button class="btn-sm" id="addBtn">+ Add</button>
   </div>
   <div style="margin-top:1.25rem;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
@@ -104,6 +127,11 @@ svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
 <div class="card" id="comparisonCard" style="display:none">
   <div class="section-title">Naive vs. Optimized</div>
   <div id="comparisonBody"></div>
+</div>
+
+<div class="card" id="cutListCard" style="display:none">
+  <div class="section-title">Saw Setup List</div>
+  <div id="cutListBody"></div>
 </div>
 
 <div class="card" id="resultsCard" style="display:none">
@@ -118,10 +146,53 @@ svg.bar-vis{width:100%;height:36px;border-radius:6px;overflow:visible}
   <div id="suggestionsBody"></div>
 </div>
 
+<div class="card" id="recentJobsCard">
+  <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
+    Recent Jobs
+    <button class="btn-sm" id="clearJobsBtn" style="font-size:11px;text-transform:none;letter-spacing:normal">Clear all</button>
+  </div>
+  <div id="recentJobsBody"><span style="font-size:13px;color:#999">No recent jobs yet.</span></div>
+</div>
+
 <script type="module">
 import init, { optimize_json } from './pkg/stock_optimizer.js';
 
 const COLORS = ['#4a7fd4','#5ba85c','#d47a4a','#a855a0','#d4b94a','#4ab8d4','#d44a6a','#7a9e4a','#d4664a','#4a9ed4'];
+
+function toFrac(val) {
+  const whole = Math.floor(val);
+  const rem = val - whole;
+  const n32 = Math.round(rem * 32);
+  if (n32 === 0) return `${whole}`;
+  if (n32 === 32) return `${whole + 1}`;
+  let num = n32, den = 32;
+  while (num % 2 === 0 && den % 2 === 0) { num /= 2; den /= 2; }
+  const frac = `<sup>${num}</sup>&frasl;<sub>${den}</sub>`;
+  return whole > 0 ? `${whole}\u2009${frac}` : frac;
+}
+
+function fmtLen(val, nominal) {
+  const dec = Number.isInteger(val) ? val + '"' : +val.toFixed(3) + '"';
+  let s = `${dec} [${toFrac(val)}"]`;
+  if (nominal !== undefined && Math.abs(val - nominal) > 0.0005) {
+    const delta = val - nominal;
+    s += ` (${delta > 0 ? '+' : ''}${+delta.toFixed(3)})`;
+  }
+  return s;
+}
+
+function collapseCuts(items) {
+  const runs = [];
+  for (const item of items) {
+    const last = runs[runs.length - 1];
+    if (last && last.label === item.label && last.color === item.color) last.count++;
+    else runs.push({label: item.label, color: item.color, count: 1});
+  }
+  return runs.map(r => {
+    const text = r.count > 1 ? `${r.count}\u00d7 ${r.label}` : r.label;
+    return `<span style="color:${r.color};font-weight:600">${text}</span>`;
+  }).join(' + ');
+}
 
 let parts = [];
 let nextId = 0;
@@ -136,11 +207,12 @@ async function loadWasm() {
 }
 loadWasm();
 
-function addPart(len, qty) {
+function addPart(len, qty, tol) {
   len = len || parseFloat(document.getElementById('newLen').value);
   qty = qty || parseInt(document.getElementById('newQty').value);
+  tol = tol ?? (parseFloat(document.getElementById('newTol').value) || 0);
   if (isNaN(len) || len <= 0 || isNaN(qty) || qty < 1) return;
-  parts.push({id: nextId++, len, qty});
+  parts.push({id: nextId++, len, qty, tol});
   renderParts();
   syncURL();
 }
@@ -161,6 +233,8 @@ function renderParts() {
       <input type="number" value="${p.len}" min="0.1" step="0.125" style="max-width:110px" data-idx="${i}" data-field="len">
       <span style="font-size:12px;color:#888">in &times;</span>
       <input type="number" value="${p.qty}" min="1" step="1" style="max-width:70px" data-idx="${i}" data-field="qty">
+      <span style="font-size:12px;color:#888">&plusmn;</span>
+      <input type="number" value="${p.tol}" min="0" step="0.0625" style="max-width:80px" data-idx="${i}" data-field="tol">
       <button class="btn-sm" data-remove="${p.id}" style="color:#c04040;border-color:#e8c0c0">&times;</button>`;
     el.appendChild(row);
   });
@@ -169,7 +243,7 @@ function renderParts() {
 function syncURL() {
   const stockLen = document.getElementById('stockLen').value;
   const kerf = document.getElementById('kerf').value;
-  const ps = parts.map(p => `${p.len}x${p.qty}`).join(',');
+  const ps = parts.map(p => p.tol ? `${p.len}x${p.qty}t${p.tol}` : `${p.len}x${p.qty}`).join(',');
   const params = new URLSearchParams({stockLen, kerf, parts: ps});
   history.replaceState(null, '', '?' + params.toString());
 }
@@ -180,12 +254,12 @@ function loadFromURL() {
   if (p.has('kerf')) document.getElementById('kerf').value = p.get('kerf');
   if (p.has('parts') && p.get('parts')) {
     p.get('parts').split(',').forEach(s => {
-      const m = s.match(/^([\d.]+)x(\d+)$/);
-      if (m) addPart(parseFloat(m[1]), parseInt(m[2]));
+      const m = s.match(/^([\d.]+)x(\d+)(?:t([\d.]+))?$/);
+      if (m) addPart(parseFloat(m[1]), parseInt(m[2]), m[3] ? parseFloat(m[3]) : 0);
     });
   }
   if (!parts.length) {
-    addPart(12, 4); addPart(16, 3); addPart(20, 2); addPart(24, 2);
+    addPart(12, 4, 0); addPart(16, 3, 0); addPart(20, 2, 0); addPart(24, 2, 0);
   }
 }
 
@@ -197,6 +271,7 @@ document.getElementById('partsList').addEventListener('change', e => {
   if (idx === undefined) return;
   if (field === 'len') parts[idx].len = parseFloat(e.target.value) || parts[idx].len;
   if (field === 'qty') parts[idx].qty = parseInt(e.target.value) || parts[idx].qty;
+  if (field === 'tol') parts[idx].tol = parseFloat(e.target.value) || 0;
   syncURL();
 });
 document.getElementById('partsList').addEventListener('click', e => {
@@ -226,69 +301,59 @@ function groupBars(bars) {
   return groups;
 }
 
-// --- SVG rendering ---
+// --- Bar rendering ---
 
-function renderBarSvg(bar, stockLen, kerf) {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('class', 'bar-vis');
-  svg.setAttribute('viewBox', '0 0 1000 36');
-  svg.setAttribute('preserveAspectRatio', 'none');
+// Build a color map keyed by "partIndex:actualLength" so that tolerance-adjusted
+// parts get their own color distinct from the same part at nominal.
+let colorMap = {};
 
-  let x = 0;
-  const scale = 1000 / stockLen;
-  const minPart = Math.min(...parts.map(p => p.len));
+function buildColorMap(bars) {
+  colorMap = {};
+  let ci = 0;
+  for (const bar of bars) {
+    for (const cut of bar.cuts) {
+      const key = `${cut.part_index}:${+cut.length.toFixed(4)}`;
+      if (!(key in colorMap)) {
+        colorMap[key] = COLORS[ci % COLORS.length];
+        ci++;
+      }
+    }
+  }
+}
+
+function cutColor(cut) {
+  return colorMap[`${cut.part_index}:${+cut.length.toFixed(4)}`] || COLORS[0];
+}
+
+function renderBar(bar, stockLen, kerf) {
+  const row = document.createElement('div');
+  row.className = 'bar-vis';
 
   bar.cuts.forEach((cut, ci) => {
     if (ci > 0 && kerf > 0) {
-      const kw = Math.max(kerf * scale, 1.5);
-      const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-      r.setAttribute('x', x); r.setAttribute('y', 0);
-      r.setAttribute('width', kw); r.setAttribute('height', 36);
-      r.setAttribute('fill', '#1a1a18');
-      svg.appendChild(r); x += kw;
+      const k = document.createElement('div');
+      k.className = 'bar-kerf';
+      k.style.width = '2px';
+      row.appendChild(k);
     }
-    const w = cut.length * scale;
-    const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    r.setAttribute('x', x); r.setAttribute('y', 0);
-    r.setAttribute('width', w); r.setAttribute('height', 36);
-    r.setAttribute('fill', COLORS[cut.part_index % COLORS.length]);
-    r.setAttribute('rx', '2');
-    svg.appendChild(r);
-    if (w > 50) {
-      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      t.setAttribute('x', x + w / 2); t.setAttribute('y', 22);
-      t.setAttribute('text-anchor', 'middle');
-      t.setAttribute('fill', 'rgba(255,255,255,0.9)');
-      t.setAttribute('font-size', '13');
-      t.setAttribute('font-family', 'system-ui,sans-serif');
-      t.setAttribute('font-weight', '500');
-      t.textContent = cut.length + '"';
-      svg.appendChild(t);
-    }
-    x += w;
+    const seg = document.createElement('div');
+    seg.className = 'bar-seg';
+    seg.style.width = (cut.length / stockLen * 100) + '%';
+    seg.style.background = cutColor(cut);
+    seg.innerHTML = toFrac(cut.length) + '"';
+    row.appendChild(seg);
   });
 
   if (bar.waste > 0.001) {
-    const ww = bar.waste * scale;
-    const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    r.setAttribute('x', x); r.setAttribute('y', 0);
-    r.setAttribute('width', ww); r.setAttribute('height', 36);
-    r.setAttribute('fill', bar.waste < minPart ? '#e8c0a0' : '#d8ead8');
-    r.setAttribute('rx', '2');
-    svg.appendChild(r);
-    if (ww > 40) {
-      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      t.setAttribute('x', x + ww / 2); t.setAttribute('y', 22);
-      t.setAttribute('text-anchor', 'middle');
-      t.setAttribute('fill', bar.waste < minPart ? '#7a3a10' : '#2a6a2a');
-      t.setAttribute('font-size', '12');
-      t.setAttribute('font-family', 'system-ui,sans-serif');
-      t.textContent = bar.waste.toFixed(2) + '"';
-      svg.appendChild(t);
-    }
+    const w = document.createElement('div');
+    w.className = 'bar-seg waste';
+    w.style.width = (bar.waste / stockLen * 100) + '%';
+    w.style.background = '#e0d8c8';
+    w.textContent = bar.waste.toFixed(2) + '"';
+    row.appendChild(w);
   }
 
-  return svg;
+  return row;
 }
 
 function renderGroupedBars(bars, stockLen, kerf, container) {
@@ -299,27 +364,35 @@ function renderGroupedBars(bars, stockLen, kerf, container) {
     const wrap = document.createElement('div');
     wrap.className = 'bar-group';
 
-    const cutDesc = bar.cuts.map(c => c.length + '"').join(' + ');
+    const cutDesc = collapseCuts(bar.cuts.map(c => ({label: fmtLen(c.length, parts[c.part_index].len), color: cutColor(c)})));
     const wasteNote = bar.waste < minPart && bar.waste > 0.001 ? ' (unusable)' : '';
     const countLabel = count > 1
       ? `<span class="bar-group-count">${count} bars</span> each: ${cutDesc}, waste: ${bar.waste.toFixed(3)}"${wasteNote}`
       : `<span class="bar-group-count">1 bar</span>: ${cutDesc}, waste: ${bar.waste.toFixed(3)}"${wasteNote}`;
 
     wrap.innerHTML = `<div class="bar-group-label">${countLabel}</div>`;
-    wrap.appendChild(renderBarSvg(bar, stockLen, kerf));
+    wrap.appendChild(renderBar(bar, stockLen, kerf));
     container.appendChild(wrap);
   });
 }
 
 function renderLegend(kerf) {
   const legendEl = document.getElementById('legend');
-  legendEl.innerHTML = '';
-  parts.forEach((p, i) => {
-    legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:${COLORS[i % COLORS.length]}"></span>${p.len}" parts</span>`;
-  });
-  legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#d8ead8"></span>usable drop</span>`;
-  legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#e8c0a0"></span>unusable drop</span>`;
-  if (kerf > 0) legendEl.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:#1a1a18"></span>kerf</span>`;
+  const items = [];
+  for (const [key, color] of Object.entries(colorMap)) {
+    const [pi, len] = key.split(':');
+    const nominal = parts[+pi].len;
+    const actual = +len;
+    const isAdj = Math.abs(actual - nominal) > 0.0005;
+    const delta = isAdj ? ` (${+(actual - nominal).toFixed(3)})` : '';
+    const label = isAdj
+      ? `${toFrac(actual)}" (nom ${toFrac(nominal)}")${delta}`
+      : `${toFrac(actual)}"`;
+    items.push(`<span class="legend-item"><span class="legend-dot" style="background:${color}"></span>${label}</span>`);
+  }
+  items.push('<span class="legend-item"><span class="legend-dot" style="background:#e0d8c8"></span>waste</span>');
+  if (kerf > 0) items.push('<span class="legend-item"><span class="legend-dot" style="background:#1a1a18"></span>kerf</span>');
+  legendEl.innerHTML = items.join('');
 }
 
 // --- Main solve ---
@@ -333,7 +406,7 @@ function solve() {
   const config = {
     stock_length: stockLen,
     kerf: kerf,
-    parts: parts.map(p => ({length: p.len, qty: p.qty})),
+    parts: parts.map(p => ({length: p.len, qty: p.qty, tolerance: p.tol || 0})),
     solve_seconds: parseFloat(document.getElementById('solveSec').value) || 5,
     max_extra_bars: parseInt(document.getElementById('maxExtraBars').value) || 3,
     suggest_seconds: parseFloat(document.getElementById('suggestSec').value) || 5,
@@ -351,8 +424,10 @@ function solve() {
 
       setStatus(`Solved in ${elapsed}ms — ${result.stats.patterns_generated} patterns, ${result.stats.solve_method}`);
       showComparison(result);
+      showCutList(result);
       showResults(result, stockLen, kerf);
       showSuggestions(result, stockLen, kerf);
+      saveJob();
     } catch (e) {
       setStatus('Error: ' + e);
     }
@@ -398,6 +473,57 @@ function showComparison(result) {
   card.style.display = '';
 }
 
+function showCutList(result) {
+  const bars = result.bars;
+
+  // Collect all distinct (part_index, actual_length) pairs with counts
+  const cutMap = new Map(); // key: "partIndex:actualLength" -> {partIndex, nominal, actual, qty}
+  for (const bar of bars) {
+    for (const cut of bar.cuts) {
+      // Round to avoid floating point key issues
+      const actualRound = +cut.length.toFixed(4);
+      const key = `${cut.part_index}:${actualRound}`;
+      if (cutMap.has(key)) {
+        cutMap.get(key).qty++;
+      } else {
+        cutMap.set(key, {
+          partIndex: cut.part_index,
+          nominal: parts[cut.part_index].len,
+          actual: actualRound,
+          qty: 1,
+        });
+      }
+    }
+  }
+
+  const entries = [...cutMap.values()];
+  entries.sort((a, b) => b.actual - a.actual); // longest first
+
+  const anyAdjusted = entries.some(e => Math.abs(e.actual - e.nominal) > 0.0005);
+
+  let html = '<table class="cut-list-table"><tr><th>Set saw to</th>';
+  if (anyAdjusted) html += '<th>Nominal</th>';
+  html += '<th class="num">Qty</th></tr>';
+
+  for (const e of entries) {
+    const isAdj = Math.abs(e.actual - e.nominal) > 0.0005;
+    const cls = isAdj ? ' class="adjusted"' : '';
+    html += `<tr><td${cls}>${fmtLen(e.actual, e.nominal)}</td>`;
+    if (anyAdjusted) {
+      html += `<td>${isAdj ? fmtLen(e.nominal) : ''}</td>`;
+    }
+    html += `<td class="num">${e.qty}</td></tr>`;
+  }
+  html += '</table>';
+
+  if (anyAdjusted) {
+    html += '<div class="cut-list-note">Highlighted lengths are adjusted within tolerance to optimize bar usage.</div>';
+  }
+
+  document.getElementById('cutListBody').innerHTML = html;
+  document.getElementById('cutListCard').style.display = '';
+}
+
 function showResults(result, stockLen, kerf) {
   const {bars, stats} = result;
 
@@ -408,6 +534,8 @@ function showResults(result, stockLen, kerf) {
     <div class="stat"><div class="stat-label">Parts cut</div><div class="stat-val">${stats.total_parts_cut}</div></div>
   `;
 
+  buildColorMap(bars);
+
   const vizEl = document.getElementById('visualization');
   vizEl.innerHTML = '';
   renderGroupedBars(bars, stockLen, kerf, vizEl);
@@ -417,6 +545,17 @@ function showResults(result, stockLen, kerf) {
 }
 
 // --- Suggestions ---
+
+function applySuggestion(quantities) {
+  quantities.forEach((q, i) => {
+    if (i < parts.length) parts[i].qty = q;
+  });
+  // Remove parts with qty 0
+  parts = parts.filter(p => p.qty > 0);
+  renderParts();
+  syncURL();
+  solve();
+}
 
 function showSuggestions(result, stockLen, kerf) {
   const card = document.getElementById('suggestionsCard');
@@ -453,11 +592,19 @@ function showSuggestions(result, stockLen, kerf) {
     div.innerHTML = `
       <div class="suggestion-header">
         <span class="suggestion-title">${barNote} — ${sg.efficiency_pct.toFixed(1)}% efficiency</span>
-        <span class="suggestion-toggle">click to expand</span>
+        <span style="display:flex;gap:8px;align-items:center">
+          <button class="btn-sm use-suggestion-btn" style="color:#3a6bc9;border-color:#a0b8e0">Use these quantities</button>
+          <span class="suggestion-toggle">click to expand</span>
+        </span>
       </div>
       <div class="suggestion-detail">${actionText} — waste: ${sg.total_waste.toFixed(2)}" (was ${result.stats.total_waste.toFixed(2)}")</div>
       <div class="suggestion-breakdown"></div>
     `;
+
+    div.querySelector('.use-suggestion-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      applySuggestion(sg.quantities);
+    });
 
     let expanded = false;
     div.addEventListener('click', () => {
@@ -472,13 +619,16 @@ function showSuggestions(result, stockLen, kerf) {
         const config = {
           stock_length: stockLen,
           kerf: kerf,
-          parts: sg.quantities.map((q, i) => ({length: parts[i].len, qty: q})),
+          parts: sg.quantities.map((q, i) => ({length: parts[i].len, qty: q, tolerance: parts[i].tol || 0})),
           max_extra_bars: 0,
           suggest_seconds: 0,
         };
         try {
           const res = JSON.parse(optimize_json(JSON.stringify(config)));
+          const savedMap = colorMap;
+          buildColorMap(res.bars);
           renderGroupedBars(res.bars, stockLen, kerf, breakdown);
+          colorMap = savedMap;
         } catch (e) {
           breakdown.textContent = 'Error: ' + e;
         }
@@ -493,7 +643,111 @@ function showSuggestions(result, stockLen, kerf) {
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
 
+// --- Recent jobs (localStorage) ---
+
+const JOBS_KEY = 'stock_optimizer_recent_jobs';
+const MAX_JOBS = 20;
+
+function getRecentJobs() {
+  try { return JSON.parse(localStorage.getItem(JOBS_KEY)) || []; }
+  catch { return []; }
+}
+
+function saveJob() {
+  const stockLen = parseFloat(document.getElementById('stockLen').value);
+  const kerf = parseFloat(document.getElementById('kerf').value) || 0;
+  const job = {
+    ts: Date.now(),
+    stockLen,
+    kerf,
+    parts: parts.map(p => ({len: p.len, qty: p.qty, tol: p.tol || 0})),
+  };
+
+  // Build a fingerprint to avoid saving duplicate consecutive runs
+  const fp = JSON.stringify({s: job.stockLen, k: job.kerf, p: job.parts});
+  const jobs = getRecentJobs();
+  // Remove any existing entry with the same fingerprint
+  const filtered = jobs.filter(j => {
+    const jfp = JSON.stringify({s: j.stockLen, k: j.kerf, p: j.parts});
+    return jfp !== fp;
+  });
+  filtered.unshift(job);
+  if (filtered.length > MAX_JOBS) filtered.length = MAX_JOBS;
+  localStorage.setItem(JOBS_KEY, JSON.stringify(filtered));
+  renderRecentJobs();
+}
+
+function loadJob(job) {
+  document.getElementById('stockLen').value = job.stockLen;
+  document.getElementById('kerf').value = job.kerf;
+  parts = [];
+  nextId = 0;
+  job.parts.forEach(p => {
+    parts.push({id: nextId++, len: p.len, qty: p.qty, tol: p.tol || 0});
+  });
+  renderParts();
+  syncURL();
+  solve();
+}
+
+function deleteJob(ts) {
+  const jobs = getRecentJobs().filter(j => j.ts !== ts);
+  localStorage.setItem(JOBS_KEY, JSON.stringify(jobs));
+  renderRecentJobs();
+}
+
+function clearAllJobs() {
+  localStorage.removeItem(JOBS_KEY);
+  renderRecentJobs();
+}
+
+function renderRecentJobs() {
+  const body = document.getElementById('recentJobsBody');
+  const jobs = getRecentJobs();
+
+  if (jobs.length === 0) {
+    body.innerHTML = '<span style="font-size:13px;color:#999">No recent jobs yet.</span>';
+    return;
+  }
+
+  body.innerHTML = '';
+  jobs.forEach(job => {
+    const row = document.createElement('div');
+    row.className = 'recent-job';
+
+    const partsSummary = job.parts.map(p => {
+      let s = `${p.len}" \u00d7 ${p.qty}`;
+      if (p.tol) s += ` \u00b1${p.tol}`;
+      return s;
+    }).join(', ');
+
+    const date = new Date(job.ts);
+    const dateStr = date.toLocaleDateString(undefined, {month: 'short', day: 'numeric'})
+      + ' ' + date.toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit'});
+
+    row.innerHTML = `
+      <div class="recent-job-summary">${job.stockLen}" stock, ${job.kerf}" kerf — ${partsSummary}</div>
+      <span class="recent-job-meta">${dateStr}</span>
+      <button class="recent-job-delete" title="Remove">&times;</button>
+    `;
+
+    row.addEventListener('click', (e) => {
+      if (e.target.classList.contains('recent-job-delete')) return;
+      loadJob(job);
+    });
+    row.querySelector('.recent-job-delete').addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteJob(job.ts);
+    });
+
+    body.appendChild(row);
+  });
+}
+
+document.getElementById('clearJobsBtn').addEventListener('click', clearAllJobs);
+
 loadFromURL();
+renderRecentJobs();
 </script>
 </body>
 </html>
