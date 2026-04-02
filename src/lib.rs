@@ -81,6 +81,9 @@ impl Config {
 pub struct PartSpec {
     pub length: f64,
     pub qty: u32,
+    /// Allowable undersize tolerance (part can be cut as short as length - tolerance)
+    #[serde(default)]
+    pub tolerance: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,19 +163,25 @@ pub fn optimize(config: &Config) -> Result<Solution, String> {
     validate(config)?;
 
     let lengths: Vec<f64> = config.parts.iter().map(|p| p.length).collect();
+    let min_lengths: Vec<f64> = config
+        .parts
+        .iter()
+        .map(|p| p.length - p.tolerance)
+        .collect();
     let demand: Vec<u32> = config.parts.iter().map(|p| p.qty).collect();
 
-    // Patterns depend only on lengths, stock_length, kerf — reusable across demand variants
-    let patterns = gen_patterns(&lengths, config.stock_length, config.kerf);
+    // Patterns depend only on lengths, stock_length, kerf — reusable across demand variants.
+    // Use min_lengths for feasibility: tolerance lets parts shrink to fit.
+    let patterns = gen_patterns(&min_lengths, config.stock_length, config.kerf);
     if patterns.is_empty() {
         return Err("No valid cutting patterns found".into());
     }
 
     let deadline = Deadline::after_secs(config.solve_seconds);
     let (assignment, exact) =
-        bnb_solve(&patterns, &demand, config.stock_length, &lengths, config.kerf, deadline);
+        bnb_solve(&patterns, &demand, config.stock_length, &min_lengths, config.kerf, deadline);
 
-    let bars = assignment_to_bars(&assignment, &lengths, config.stock_length, config.kerf);
+    let bars = assignment_to_bars(&assignment, &lengths, &min_lengths, config.stock_length, config.kerf);
     let stats = compute_stats(&bars, config.stock_length, patterns.len(), exact);
 
     let suggestions = find_suggestions(
@@ -180,6 +189,7 @@ pub fn optimize(config: &Config) -> Result<Solution, String> {
         &demand,
         config.stock_length,
         &lengths,
+        &min_lengths,
         config.kerf,
         stats.total_bars,
         stats.efficiency_pct,
@@ -200,12 +210,13 @@ pub fn optimize(config: &Config) -> Result<Solution, String> {
 fn assignment_to_bars(
     assignment: &[Pattern],
     lengths: &[f64],
+    min_lengths: &[f64],
     stock_length: f64,
     kerf: f64,
 ) -> Vec<Bar> {
     assignment
         .iter()
-        .map(|pattern| build_bar(pattern, lengths, stock_length, kerf))
+        .map(|pattern| build_bar(pattern, lengths, min_lengths, stock_length, kerf))
         .collect()
 }
 
@@ -245,12 +256,17 @@ fn compute_naive(config: &Config) -> NaiveSolution {
 
     for p in &config.parts {
         // How many of this part fit on one bar?
-        // k parts cost: k * length + (k-1) * kerf = k*(length+kerf) - kerf
-        // k <= (stock_length + kerf) / (length + kerf)
-        let per_bar = ((config.stock_length + config.kerf) / (p.length + config.kerf)).floor() as u32;
+        // Use min_length (length - tolerance) for feasibility.
+        // k parts cost: k * min_length + (k-1) * kerf
+        // k <= (stock_length + kerf) / (min_length + kerf)
+        let min_len = p.length - p.tolerance;
+        let per_bar = ((config.stock_length + config.kerf) / (min_len + config.kerf)).floor() as u32;
         let per_bar = per_bar.max(1);
         let bars_needed = (p.qty + per_bar - 1) / per_bar;
-        let full_bar_used = p.length * per_bar as f64 + config.kerf * (per_bar - 1) as f64;
+        // Actual cut length: distribute bar evenly among parts
+        let actual_len = ((config.stock_length - config.kerf * (per_bar - 1) as f64) / per_bar as f64)
+            .min(p.length);
+        let full_bar_used = actual_len * per_bar as f64 + config.kerf * (per_bar - 1) as f64;
         let waste_per_bar = config.stock_length - full_bar_used;
 
         // The last bar may be partial
@@ -258,14 +274,14 @@ fn compute_naive(config: &Config) -> NaiveSolution {
         let full_bars = if remaining == 0 { bars_needed } else { bars_needed - 1 };
         let part_waste = waste_per_bar * full_bars as f64;
         let last_bar_waste = if remaining > 0 {
-            let last_used = p.length * remaining as f64 + config.kerf * remaining.saturating_sub(1) as f64;
+            let last_used = actual_len * remaining as f64 + config.kerf * remaining.saturating_sub(1) as f64;
             config.stock_length - last_used
         } else {
             0.0
         };
 
         per_part.push(NaivePartBreakdown {
-            length: p.length,
+            length: actual_len,
             qty: p.qty,
             per_bar,
             bars_needed,
@@ -273,7 +289,7 @@ fn compute_naive(config: &Config) -> NaiveSolution {
         });
 
         total_bars += bars_needed;
-        total_parts_material += p.length * p.qty as f64;
+        total_parts_material += actual_len * p.qty as f64;
         total_waste += part_waste + last_bar_waste;
     }
 
@@ -304,6 +320,7 @@ fn find_suggestions(
     demand: &[u32],
     stock_length: f64,
     lengths: &[f64],
+    min_lengths: &[f64],
     kerf: f64,
     baseline_bars: usize,
     baseline_efficiency: f64,
@@ -321,7 +338,7 @@ fn find_suggestions(
             break;
         }
         if let Some(s) = best_overproduction_at(
-            patterns, demand, stock_length, lengths, kerf,
+            patterns, demand, stock_length, lengths, min_lengths, kerf,
             target_bars, baseline_bars, deadline,
         ) {
             suggestions.push(s);
@@ -349,8 +366,8 @@ fn find_suggestions(
                 break;
             }
             let (assignment, _) =
-                bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
-            let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
+                bnb_solve(patterns, &trial, stock_length, min_lengths, kerf, deadline);
+            let bars = assignment_to_bars(&assignment, lengths, min_lengths, stock_length, kerf);
             let s = make_suggestion(&trial, demand, &bars, stock_length, baseline_bars);
 
             // Only interesting if it saves bars or improves efficiency
@@ -384,8 +401,8 @@ fn find_suggestions(
         }
         if any_reduced && trial.iter().any(|&q| q > 0) {
             let (assignment, _) =
-                bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
-            let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
+                bnb_solve(patterns, &trial, stock_length, min_lengths, kerf, deadline);
+            let bars = assignment_to_bars(&assignment, lengths, min_lengths, stock_length, kerf);
             let s = make_suggestion(&trial, demand, &bars, stock_length, baseline_bars);
             if s.total_bars < baseline_bars || s.efficiency_pct > baseline_efficiency + 0.5 {
                 let dominated = best_under.as_ref().is_some_and(|prev| {
@@ -424,6 +441,7 @@ fn best_overproduction_at(
     demand: &[u32],
     stock_length: f64,
     lengths: &[f64],
+    min_lengths: &[f64],
     kerf: f64,
     target_bars: usize,
     baseline_bars: usize,
@@ -439,8 +457,8 @@ fn best_overproduction_at(
         }
         let total_capacity = target_bars as f64 * stock_length;
         let current_material: f64 =
-            demand.iter().zip(lengths).map(|(&q, &l)| q as f64 * l).sum();
-        let upper = ((total_capacity - current_material) / lengths[i]).floor() as u32;
+            demand.iter().zip(min_lengths).map(|(&q, &l)| q as f64 * l).sum();
+        let upper = ((total_capacity - current_material) / min_lengths[i]).floor() as u32;
         if upper == 0 {
             continue;
         }
@@ -451,7 +469,7 @@ fn best_overproduction_at(
             let mut trial = demand.to_vec();
             trial[i] += mid;
             let (assignment, _) =
-                bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
+                bnb_solve(patterns, &trial, stock_length, min_lengths, kerf, deadline);
             if assignment.len() <= target_bars {
                 lo = mid;
             } else {
@@ -472,9 +490,9 @@ fn best_overproduction_at(
     }
 
     let (assignment, _) =
-        bnb_solve(patterns, &best_trial, stock_length, lengths, kerf, deadline);
+        bnb_solve(patterns, &best_trial, stock_length, min_lengths, kerf, deadline);
     if assignment.len() <= target_bars {
-        let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
+        let bars = assignment_to_bars(&assignment, lengths, min_lengths, stock_length, kerf);
         let s = make_suggestion(&best_trial, demand, &bars, stock_length, baseline_bars);
         if s.extra.iter().any(|&e| e > 0) {
             return Some(s);
@@ -484,8 +502,8 @@ fn best_overproduction_at(
     // All-at-once doesn't fit. Greedy: add one part type at a time.
     let mut order: Vec<usize> = (0..n).filter(|&i| per_type_max[i] > 0).collect();
     order.sort_by(|&a, &b| {
-        (per_type_max[b] as f64 * lengths[b])
-            .partial_cmp(&(per_type_max[a] as f64 * lengths[a]))
+        (per_type_max[b] as f64 * min_lengths[b])
+            .partial_cmp(&(per_type_max[a] as f64 * min_lengths[a]))
             .unwrap()
     });
 
@@ -500,7 +518,7 @@ fn best_overproduction_at(
             let mut trial = combined.clone();
             trial[i] += mid;
             let (assignment, _) =
-                bnb_solve(patterns, &trial, stock_length, lengths, kerf, deadline);
+                bnb_solve(patterns, &trial, stock_length, min_lengths, kerf, deadline);
             if assignment.len() <= target_bars {
                 lo = mid;
             } else {
@@ -516,8 +534,8 @@ fn best_overproduction_at(
     }
 
     let (assignment, _) =
-        bnb_solve(patterns, &combined, stock_length, lengths, kerf, deadline);
-    let bars = assignment_to_bars(&assignment, lengths, stock_length, kerf);
+        bnb_solve(patterns, &combined, stock_length, min_lengths, kerf, deadline);
+    let bars = assignment_to_bars(&assignment, lengths, min_lengths, stock_length, kerf);
     Some(make_suggestion(&combined, demand, &bars, stock_length, baseline_bars))
 }
 
@@ -567,6 +585,12 @@ fn validate(config: &Config) -> Result<(), String> {
         }
         if p.qty == 0 {
             return Err(format!("Part {} has zero quantity", i + 1));
+        }
+        if p.tolerance < 0.0 {
+            return Err(format!("Part {} has negative tolerance", i + 1));
+        }
+        if p.tolerance >= p.length {
+            return Err(format!("Part {} tolerance exceeds its length", i + 1));
         }
         if p.length > config.stock_length {
             return Err(format!(
@@ -681,8 +705,9 @@ fn pattern_material(pattern: &[u32], lengths: &[f64], kerf: f64) -> f64 {
 }
 
 /// Best Fit Decreasing heuristic — produces a quick feasible solution.
-fn bfd(lengths: &[f64], demand: &[u32], stock_length: f64, kerf: f64) -> Vec<Pattern> {
-    let n = lengths.len();
+/// Uses `min_lengths` for feasibility (parts can shrink within tolerance).
+fn bfd(min_lengths: &[f64], demand: &[u32], stock_length: f64, kerf: f64) -> Vec<Pattern> {
+    let n = min_lengths.len();
 
     // Expand demand into individual part indices, sorted by length descending
     let mut all_parts: Vec<usize> = Vec::new();
@@ -691,7 +716,7 @@ fn bfd(lengths: &[f64], demand: &[u32], stock_length: f64, kerf: f64) -> Vec<Pat
             all_parts.push(i);
         }
     }
-    all_parts.sort_by(|&a, &b| lengths[b].partial_cmp(&lengths[a]).unwrap());
+    all_parts.sort_by(|&a, &b| min_lengths[b].partial_cmp(&min_lengths[a]).unwrap());
 
     struct OpenBar {
         counts: Vec<u32>,
@@ -702,8 +727,8 @@ fn bfd(lengths: &[f64], demand: &[u32], stock_length: f64, kerf: f64) -> Vec<Pat
     let mut bars: Vec<OpenBar> = Vec::new();
 
     for &pi in &all_parts {
-        let cost_existing = kerf + lengths[pi];
-        let cost_new = lengths[pi];
+        let cost_existing = kerf + min_lengths[pi];
+        let cost_new = min_lengths[pi];
 
         let mut best_idx: Option<usize> = None;
         let mut best_rem = f64::INFINITY;
@@ -960,19 +985,56 @@ fn bnb_search(
     multiplicities[pat_idx] = 0;
 }
 
-fn build_bar(pattern: &Pattern, lengths: &[f64], stock_length: f64, kerf: f64) -> Bar {
+fn build_bar(
+    pattern: &Pattern,
+    lengths: &[f64],
+    min_lengths: &[f64],
+    stock_length: f64,
+    kerf: f64,
+) -> Bar {
+    let total_pieces: u32 = pattern.iter().sum();
+    if total_pieces == 0 {
+        return Bar {
+            cuts: Vec::new(),
+            used: 0.0,
+            waste: stock_length,
+        };
+    }
+
+    // Material used at minimum lengths (what the pattern was validated against)
+    let min_material = pattern_material(pattern, min_lengths, kerf);
+    let slack = stock_length - min_material;
+
+    // Distribute slack proportionally to each part's tolerance range.
+    // Each part can grow from min_lengths[i] up to lengths[i].
+    let total_tolerance: f64 = pattern
+        .iter()
+        .zip(lengths.iter().zip(min_lengths.iter()))
+        .map(|(&c, (&nom, &min))| c as f64 * (nom - min))
+        .sum();
+
     let mut cuts: Vec<Cut> = Vec::new();
     for (i, &count) in pattern.iter().enumerate() {
+        let tol = lengths[i] - min_lengths[i];
+        let actual_length = if total_tolerance > 0.0 {
+            // Grow each part proportionally to its tolerance, capped at nominal
+            let growth = (tol / total_tolerance) * slack;
+            (min_lengths[i] + growth).min(lengths[i])
+        } else {
+            // No tolerance — parts are at nominal length
+            lengths[i]
+        };
         for _ in 0..count {
             cuts.push(Cut {
                 part_index: i,
-                length: lengths[i],
+                length: actual_length,
             });
         }
     }
     cuts.sort_by(|a, b| b.length.partial_cmp(&a.length).unwrap());
 
-    let used = pattern_material(pattern, lengths, kerf);
+    let used: f64 = cuts.iter().map(|c| c.length).sum::<f64>()
+        + kerf * (total_pieces - 1) as f64;
     let waste = stock_length - used;
 
     Bar { cuts, used, waste }
@@ -1006,7 +1068,7 @@ mod tests {
     #[test]
     fn test_simple_fit() {
         let sol = optimize(&cfg(72.0, 0.125, vec![
-            PartSpec { length: 35.0, qty: 2 },
+            PartSpec { length: 35.0, qty: 2, tolerance: 0.0 },
         ])).unwrap();
         assert_eq!(sol.bars.len(), 1);
         assert_eq!(sol.bars[0].cuts.len(), 2);
@@ -1015,7 +1077,7 @@ mod tests {
     #[test]
     fn test_doesnt_fit_one_bar() {
         let sol = optimize(&cfg(72.0, 0.125, vec![
-            PartSpec { length: 37.0, qty: 2 },
+            PartSpec { length: 37.0, qty: 2, tolerance: 0.0 },
         ])).unwrap();
         assert_eq!(sol.bars.len(), 2);
     }
@@ -1023,10 +1085,10 @@ mod tests {
     #[test]
     fn test_default_example() {
         let config = cfg(72.0, 0.125, vec![
-            PartSpec { length: 12.0, qty: 4 },
-            PartSpec { length: 16.0, qty: 3 },
-            PartSpec { length: 20.0, qty: 2 },
-            PartSpec { length: 24.0, qty: 2 },
+            PartSpec { length: 12.0, qty: 4, tolerance: 0.0 },
+            PartSpec { length: 16.0, qty: 3, tolerance: 0.0 },
+            PartSpec { length: 20.0, qty: 2, tolerance: 0.0 },
+            PartSpec { length: 24.0, qty: 2, tolerance: 0.0 },
         ]);
         let sol = optimize(&config).unwrap();
         assert!(sol.bars.len() >= 3);
@@ -1046,7 +1108,7 @@ mod tests {
     #[test]
     fn test_kerf_accounting() {
         let sol = optimize(&cfg(10.0, 1.0, vec![
-            PartSpec { length: 3.0, qty: 3 },
+            PartSpec { length: 3.0, qty: 3, tolerance: 0.0 },
         ])).unwrap();
         assert_eq!(sol.bars.len(), 2);
     }
@@ -1054,7 +1116,7 @@ mod tests {
     #[test]
     fn test_zero_kerf() {
         let sol = optimize(&cfg(10.0, 0.0, vec![
-            PartSpec { length: 2.5, qty: 8 },
+            PartSpec { length: 2.5, qty: 8, tolerance: 0.0 },
         ])).unwrap();
         assert_eq!(sol.bars.len(), 2);
     }
@@ -1062,7 +1124,7 @@ mod tests {
     #[test]
     fn test_part_exceeds_stock() {
         assert!(optimize(&cfg(10.0, 0.0, vec![
-            PartSpec { length: 11.0, qty: 1 },
+            PartSpec { length: 11.0, qty: 1, tolerance: 0.0 },
         ])).is_err());
     }
 
@@ -1080,18 +1142,59 @@ mod tests {
         assert_eq!(config.solve_seconds, 5.0); // default applied
         assert_eq!(config.max_extra_bars, 3); // default applied
         assert_eq!(config.suggest_seconds, 5.0); // default applied
+        assert_eq!(config.parts[0].tolerance, 0.0); // default applied
     }
 
     #[test]
     fn test_waste_is_non_negative() {
         let sol = optimize(&cfg(72.0, 0.125, vec![
-            PartSpec { length: 12.0, qty: 4 },
-            PartSpec { length: 16.0, qty: 3 },
-            PartSpec { length: 20.0, qty: 2 },
-            PartSpec { length: 24.0, qty: 2 },
+            PartSpec { length: 12.0, qty: 4, tolerance: 0.0 },
+            PartSpec { length: 16.0, qty: 3, tolerance: 0.0 },
+            PartSpec { length: 20.0, qty: 2, tolerance: 0.0 },
+            PartSpec { length: 24.0, qty: 2, tolerance: 0.0 },
         ])).unwrap();
         for bar in &sol.bars {
             assert!(bar.waste >= -1e-9, "Bar has negative waste: {}", bar.waste);
+        }
+    }
+
+    #[test]
+    fn test_tolerance_fits_more() {
+        // Without tolerance: 24*3 + 0.125*2 = 72.25 > 72 → only 2 per bar → 2 bars
+        let sol_no_tol = optimize(&cfg(72.0, 0.125, vec![
+            PartSpec { length: 24.0, qty: 3, tolerance: 0.0 },
+        ])).unwrap();
+        assert_eq!(sol_no_tol.bars.len(), 2);
+
+        // With tolerance 0.125: min_length=23.875, 23.875*3 + 0.125*2 = 71.875 ≤ 72 → 1 bar
+        let sol_tol = optimize(&cfg(72.0, 0.125, vec![
+            PartSpec { length: 24.0, qty: 3, tolerance: 0.125 },
+        ])).unwrap();
+        assert_eq!(sol_tol.bars.len(), 1);
+        assert_eq!(sol_tol.bars[0].cuts.len(), 3);
+
+        // Each cut should be between 23.875 and 24.0
+        for cut in &sol_tol.bars[0].cuts {
+            assert!(cut.length >= 23.875 - 1e-9, "Cut too short: {}", cut.length);
+            assert!(cut.length <= 24.0 + 1e-9, "Cut exceeds nominal: {}", cut.length);
+        }
+
+        // Waste should be near zero
+        assert!(sol_tol.bars[0].waste < 0.2, "Too much waste: {}", sol_tol.bars[0].waste);
+    }
+
+    #[test]
+    fn test_tolerance_zero_is_unchanged() {
+        // With tolerance=0, behavior should match the original
+        let sol = optimize(&cfg(10.0, 1.0, vec![
+            PartSpec { length: 3.0, qty: 3, tolerance: 0.0 },
+        ])).unwrap();
+        assert_eq!(sol.bars.len(), 2);
+        // Cuts should be exactly nominal
+        for bar in &sol.bars {
+            for cut in &bar.cuts {
+                assert!((cut.length - 3.0).abs() < 1e-9);
+            }
         }
     }
 }
